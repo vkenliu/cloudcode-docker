@@ -6,21 +6,25 @@ ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install base system dependencies and dev tools (stable layer, cached aggressively)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    curl \
-    git \
-    jq \
-    less \
-    make \
-    openssh-client \
-    procps \
-    tree \
-    unzip \
-    vim-tiny \
-    tmux \
-    wget
+RUN for i in 1 2 3 4 5; do \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        less \
+        make \
+        openssh-client \
+        procps \
+        tree \
+        unzip \
+        vim-tiny \
+        tmux \
+        wget \
+    && break || (apt-get install -y --fix-broken 2>/dev/null; sleep 10); \
+    done
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -28,8 +32,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
     | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y gh
+    && for i in 1 2 3; do apt-get update && apt-get install -y gh && break || sleep 10; done
 
 
 # Install cloudflared (Cloudflare Tunnel, for exposing local services to the internet)
@@ -37,8 +40,7 @@ RUN curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
     | tee /usr/share/keyrings/cloudflare-main.gpg > /dev/null \
     && echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
     | tee /etc/apt/sources.list.d/cloudflared.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y cloudflared
+    && for i in 1 2 3; do apt-get update && apt-get install -y cloudflared && break || sleep 10; done
 
 # Install Go
 ENV GO_VERSION=1.23.6
@@ -48,7 +50,7 @@ ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
 
 # Install Node.js (LTS) via NodeSource
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs
+    && for i in 1 2 3; do apt-get install -y nodejs && break || sleep 10; done
 
 # Install Bun
 RUN curl -fsSL https://bun.sh/install | bash
@@ -65,8 +67,9 @@ RUN bun install -g oh-my-opencode-linux-arm64@latest || true
 RUN bun install -g @fission-ai/openspec@latest
 
 # Install Playwright chromium with all system dependencies (for browser automation skills)
-# --with-deps auto-installs required shared libraries (libatk, libnss3, libgbm, etc.)
-RUN npx playwright install --with-deps chromium
+# Split into two steps: binary download first (reliable), then apt deps with retry
+RUN npx playwright install chromium
+RUN for i in 1 2 3 4 5; do npx playwright install-deps chromium && break || sleep 15; done
 # Symlink chromium binary to well-known paths so tools can find it without PLAYWRIGHT_BROWSERS_PATH
 # find handles both chrome-linux/ (arm64) and chrome-linux64/ (amd64) directory names across architectures
 RUN CHROME_BIN=$(find /root/.cache/ms-playwright/chromium-* -name chrome -type f | head -1) \

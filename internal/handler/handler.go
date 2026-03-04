@@ -1,18 +1,16 @@
 package handler
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,28 +27,24 @@ type Handler struct {
 	docker   *docker.Manager
 	proxy    *proxy.ReverseProxy
 	config   *config.Manager
-	tmpls    map[string]*template.Template
 	portPool *PortPool
 }
 
 // PortPool allocates ports for new instances.
 type PortPool struct {
+	mu    sync.Mutex
 	start int
 	end   int
 	used  map[int]bool
 }
 
-// NewPortPool creates a port pool with the given range.
 func NewPortPool(start, end int) *PortPool {
-	return &PortPool{
-		start: start,
-		end:   end,
-		used:  make(map[int]bool),
-	}
+	return &PortPool{start: start, end: end, used: make(map[int]bool)}
 }
 
-// Allocate returns the next available port.
 func (pp *PortPool) Allocate() (int, error) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
 	for p := pp.start; p <= pp.end; p++ {
 		if !pp.used[p] {
 			pp.used[p] = true
@@ -60,34 +54,33 @@ func (pp *PortPool) Allocate() (int, error) {
 	return 0, fmt.Errorf("no available ports in range %d-%d", pp.start, pp.end)
 }
 
-// Release frees a port.
 func (pp *PortPool) Release(port int) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
 	delete(pp.used, port)
 }
 
-// MarkUsed marks a port as used.
 func (pp *PortPool) MarkUsed(port int) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
 	pp.used[port] = true
 }
 
-func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager, tmpls map[string]*template.Template) *Handler {
+func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager) *Handler {
 	h := &Handler{
 		store:    s,
 		docker:   dm,
 		proxy:    rp,
 		config:   cfgMgr,
-		tmpls:    tmpls,
 		portPool: NewPortPool(10000, 10100),
 	}
 
-	// Load existing instances and mark their ports as used
 	instances, err := s.List()
 	if err == nil {
 		for _, inst := range instances {
 			if inst.Port > 0 {
 				h.portPool.MarkUsed(inst.Port)
 			}
-			// Register proxy for running instances
 			if inst.Status == "running" && inst.Port > 0 {
 				_ = rp.Register(inst.ID, inst.Port)
 			}
@@ -99,198 +92,197 @@ func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *con
 
 // RegisterRoutes sets up all HTTP routes.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	// Static files
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	// --- Instances API ---
+	mux.HandleFunc("GET /api/instances", h.apiListInstances)
+	mux.HandleFunc("POST /api/instances", h.apiCreateInstance)
+	mux.HandleFunc("GET /api/instances/{id}", h.apiGetInstance)
+	mux.HandleFunc("DELETE /api/instances/{id}", h.apiDeleteInstance)
+	mux.HandleFunc("POST /api/instances/{id}/start", h.apiStartInstance)
+	mux.HandleFunc("POST /api/instances/{id}/stop", h.apiStopInstance)
+	mux.HandleFunc("POST /api/instances/{id}/restart", h.apiRestartInstance)
+	mux.HandleFunc("GET /api/instances/{id}/status", h.apiInstanceStatus)
 
-	mux.HandleFunc("GET /{$}", h.handleDashboard)
-	mux.HandleFunc("GET /instances/new", h.handleNewInstanceForm)
-	mux.HandleFunc("GET /settings", h.handleSettings)
-	mux.HandleFunc("POST /settings/env", h.handleSaveEnvVars)
-	mux.HandleFunc("GET /settings/file", h.handleGetConfigFile)
-	mux.HandleFunc("POST /settings/file", h.handleSaveConfigFile)
-	mux.HandleFunc("GET /settings/dir-files", h.handleListDirFiles)
-	mux.HandleFunc("POST /settings/dir-file", h.handleSaveDirFile)
-	mux.HandleFunc("DELETE /settings/dir-file", h.handleDeleteDirFile)
-	mux.HandleFunc("DELETE /settings/agents-skill", h.handleDeleteAgentsSkill)
+	// --- System API ---
+	mux.HandleFunc("GET /api/system/resources", h.apiSystemResources)
 
-	// Instance CRUD (HTMX endpoints)
-	mux.HandleFunc("POST /instances", h.handleCreateInstance)
-	mux.HandleFunc("GET /instances/{id}", h.handleGetInstance)
-	mux.HandleFunc("DELETE /instances/{id}", h.handleDeleteInstance)
+	// --- Settings API ---
+	mux.HandleFunc("GET /api/settings", h.apiGetSettings)
+	mux.HandleFunc("PUT /api/settings/env", h.apiSaveEnvVars)
+	mux.HandleFunc("GET /api/settings/file", h.apiGetConfigFile)
+	mux.HandleFunc("PUT /api/settings/file", h.apiSaveConfigFile)
+	mux.HandleFunc("GET /api/settings/dir-files", h.apiListDirFiles)
+	mux.HandleFunc("PUT /api/settings/dir-file", h.apiSaveDirFile)
+	mux.HandleFunc("DELETE /api/settings/dir-file", h.apiDeleteDirFile)
+	mux.HandleFunc("DELETE /api/settings/agents-skill", h.apiDeleteAgentsSkill)
 
-	// Instance actions
-	mux.HandleFunc("POST /instances/{id}/start", h.handleStartInstance)
-	mux.HandleFunc("POST /instances/{id}/stop", h.handleStopInstance)
-	mux.HandleFunc("POST /instances/{id}/restart", h.handleRestartInstance)
+	// --- WebSocket endpoints (unchanged) ---
 	mux.HandleFunc("GET /instances/{id}/logs/ws", h.handleLogsWS)
-	mux.HandleFunc("GET /instances/{id}/status", h.handleInstanceStatus)
-	mux.HandleFunc("GET /instances/{id}/terminal", h.handleTerminalPage)
 	mux.HandleFunc("GET /instances/{id}/terminal/ws", h.handleTerminalWS)
 
-	// Reverse proxy to opencode web UI
+	// --- Reverse proxy to OpenCode web UI ---
 	mux.HandleFunc("/instance/{id}/", h.handleProxy)
 
-	// Catch-all: route non-platform requests to containers via Referer header
+	// --- Catch-all: SPA asset fallback (must be last) ---
 	mux.HandleFunc("/", h.handleCatchAll)
 }
 
-// --- Page handlers ---
+// --- Helpers ---
 
-func (h *Handler) handleDashboard(w http.ResponseWriter, r *http.Request) {
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func writeNoContent(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Instance API handlers ---
+
+func (h *Handler) apiListInstances(w http.ResponseWriter, r *http.Request) {
 	instances, err := h.store.List()
 	if err != nil {
-		http.Error(w, "Failed to list instances", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to list instances")
 		return
 	}
-
-	for _, inst := range instances {
-		if inst.ContainerID != "" && h.docker != nil {
-			status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID)
-			if err == nil && status != inst.Status {
-				inst.Status = status
-				_ = h.store.Update(inst)
+	// Sync Docker status for each instance in parallel (#15)
+	if h.docker != nil {
+		var wg sync.WaitGroup
+		for _, inst := range instances {
+			if inst.ContainerID == "" {
+				continue
 			}
-		}
-	}
-
-	data := map[string]interface{}{
-		"Instances": instances,
-		"Title":     "CloudCode - Dashboard",
-	}
-	h.render(w, "dashboard", data)
-}
-
-func (h *Handler) handleNewInstanceForm(w http.ResponseWriter, r *http.Request) {
-	var memInfo runtime.MemStats
-	runtime.ReadMemStats(&memInfo)
-	// TotalMemoryMB: 宿主机总物理内存，用于创建实例页面展示参考
-	totalMemMB := int(memInfo.Sys / 1024 / 1024)
-	// sysconf 获取物理内存更准确，但 MemStats.Sys 作为 Go 进程视角的系统内存已足够参考
-	if f, err := os.Open("/proc/meminfo"); err == nil {
-		defer f.Close()
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "MemTotal:") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					if kb, err := strconv.Atoi(fields[1]); err == nil {
-						totalMemMB = kb / 1024
+			wg.Add(1)
+			go func(inst *store.Instance) {
+				defer wg.Done()
+				if status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID); err == nil && status != inst.Status {
+					inst.Status = status
+					if err := h.store.Update(inst); err != nil {
+						log.Printf("Warning: failed to update instance %s status: %v", inst.ID, err)
 					}
 				}
-				break
-			}
+			}(inst)
 		}
+		wg.Wait()
 	}
-
-	h.render(w, "new_instance", map[string]interface{}{
-		"Title":         "CloudCode - New Instance",
-		"TotalMemoryMB": totalMemMB,
-		"TotalCPUCores": runtime.NumCPU(),
-	})
+	if instances == nil {
+		instances = []*store.Instance{}
+	}
+	writeJSON(w, http.StatusOK, instances)
 }
 
-// --- Instance CRUD ---
-
-func (h *Handler) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	name := strings.TrimSpace(r.FormValue("name"))
-	if name == "" {
-		http.Error(w, "Name is required", http.StatusBadRequest)
-		return
-	}
-
-	if existing, _ := h.store.GetByName(name); existing != nil {
-		http.Error(w, "Instance name already exists", http.StatusConflict)
-		return
-	}
-
-	port, err := h.portPool.Allocate()
-	if err != nil {
-		http.Error(w, "No available ports", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Parse resource limits: 0 = unlimited
-	memoryMB, _ := strconv.Atoi(r.FormValue("memory_mb"))
-	cpuCores, _ := strconv.ParseFloat(r.FormValue("cpu_cores"), 64)
-
-	inst := &store.Instance{
-		ID:       uuid.New().String()[:8],
-		Name:     name,
-		Status:   "created",
-		Port:     port,
-		WorkDir:  "/root",
-		EnvVars:  make(map[string]string),
-		MemoryMB: memoryMB,
-		CPUCores: cpuCores,
-	}
-
-	if err := h.store.Create(inst); err != nil {
-		h.portPool.Release(port)
-		http.Error(w, "Failed to create instance", http.StatusInternalServerError)
-		return
-	}
-
-	if h.docker != nil {
-		// 使用 background context：创建容器不能依赖 request context，否则用户关闭浏览器会中断操作
-		containerID, err := h.docker.CreateContainer(context.Background(), inst)
-		if err != nil {
-			log.Printf("Error creating container for %s: %v", inst.ID, err)
-			inst.Status = "error"
-			inst.ErrorMsg = err.Error()
-			_ = h.store.Update(inst)
-		} else {
-			inst.ContainerID = containerID
-			inst.Status = "running"
-			_ = h.store.Update(inst)
-
-			if err := h.proxy.Register(inst.ID, inst.Port); err != nil {
-				log.Printf("Error registering proxy for %s: %v", inst.ID, err)
-			}
-		}
-	}
-
-	w.Header().Set("HX-Redirect", "/")
-	w.WriteHeader(http.StatusCreated)
-}
-
-func (h *Handler) handleGetInstance(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiGetInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
-
 	if inst.ContainerID != "" && h.docker != nil {
 		if status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID); err == nil {
 			inst.Status = status
 			_ = h.store.Update(inst)
 		}
 	}
-
-	data := map[string]interface{}{
-		"Instance": inst,
-		"Title":    fmt.Sprintf("CloudCode - %s", inst.Name),
-	}
-	h.render(w, "instance_detail", data)
+	writeJSON(w, http.StatusOK, inst)
 }
 
-func (h *Handler) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiCreateInstance(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit (#17)
+	var req struct {
+		Name     string  `json:"name"`
+		MemoryMB int     `json:"memory_mb"`
+		CPUCores float64 `json:"cpu_cores"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+
+	if existing, _ := h.store.GetByName(req.Name); existing != nil {
+		writeError(w, http.StatusConflict, "instance name already exists")
+		return
+	}
+
+	port, err := h.portPool.Allocate()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "no available ports")
+		return
+	}
+
+	inst := &store.Instance{
+		Name:     req.Name,
+		Status:   "created",
+		Port:     port,
+		WorkDir:  "/root",
+		EnvVars:  make(map[string]string),
+		MemoryMB: req.MemoryMB,
+		CPUCores: req.CPUCores,
+	}
+
+	// #13: retry on ID collision (astronomically rare but correct to handle)
+	var createErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		inst.ID = uuid.New().String()[:8]
+		if createErr = h.store.Create(inst); createErr == nil {
+			break
+		}
+		if !strings.Contains(createErr.Error(), "UNIQUE constraint") {
+			break
+		}
+	}
+	if createErr != nil {
+		h.portPool.Release(port)
+		writeError(w, http.StatusInternalServerError, "failed to create instance")
+		return
+	}
+
+	if h.docker != nil {
+		containerID, err := h.docker.CreateContainer(r.Context(), inst) // #7 use r.Context()
+		if err != nil {
+			log.Printf("Error creating container for %s: %v", inst.ID, err)
+			// #6: release port so it can be reused since container creation failed
+			h.portPool.Release(inst.Port)
+			inst.Status = "error"
+			inst.ErrorMsg = err.Error()
+			if updateErr := h.store.Update(inst); updateErr != nil {
+				log.Printf("Warning: failed to update instance %s: %v", inst.ID, updateErr)
+			}
+		} else {
+			inst.ContainerID = containerID
+			inst.Status = "running"
+			if updateErr := h.store.Update(inst); updateErr != nil {
+				log.Printf("Warning: failed to update instance %s: %v", inst.ID, updateErr)
+			}
+			if err := h.proxy.Register(inst.ID, inst.Port); err != nil {
+				log.Printf("Error registering proxy for %s: %v", inst.ID, err)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, inst)
+}
+
+func (h *Handler) apiDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
 
 	if inst.ContainerID != "" && h.docker != nil {
-		// 使用 background context：删除容器不能依赖 request context，否则用户关闭浏览器会中断操作
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := h.docker.RemoveContainerAndVolume(ctx, inst.ContainerID, id); err != nil {
@@ -303,123 +295,400 @@ func (h *Handler) handleDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	h.config.RemoveInstanceData(id)
 
 	if err := h.store.Delete(id); err != nil {
-		http.Error(w, "Failed to delete instance", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to delete instance")
 		return
 	}
 
-	referer := r.Header.Get("Referer")
-	if referer != "" && strings.Contains(referer, "/instances/") {
-		w.Header().Set("HX-Redirect", "/")
-	} else {
-		w.Header().Set("HX-Trigger", fmt.Sprintf(`{"instanceDeleted":{"id":"%s"}}`, id))
-	}
-	w.WriteHeader(http.StatusOK)
+	writeNoContent(w)
 }
 
-// --- Instance actions ---
-
-func (h *Handler) handleStartInstance(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiStartInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
 
 	if h.docker == nil {
-		respondError(w, "Docker is not available")
+		writeError(w, http.StatusInternalServerError, "docker is not available")
 		return
 	}
 
 	if inst.ContainerID == "" {
-		// 使用 background context：创建容器不能依赖 request context，否则用户关闭浏览器会中断操作
-		containerID, err := h.docker.CreateContainer(context.Background(), inst)
+		containerID, err := h.docker.CreateContainer(r.Context(), inst) // #7
 		if err != nil {
 			inst.Status = "error"
 			inst.ErrorMsg = err.Error()
 			_ = h.store.Update(inst)
-			respondError(w, "Failed to create container: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to create container: "+err.Error())
 			return
 		}
 		inst.ContainerID = containerID
 	} else {
-		// 使用 background context：启动容器不能依赖 request context，否则用户关闭浏览器会中断操作
-		if err := h.docker.StartContainer(context.Background(), inst.ContainerID); err != nil {
+		if err := h.docker.StartContainer(r.Context(), inst.ContainerID); err != nil { // #7
 			inst.Status = "error"
 			inst.ErrorMsg = err.Error()
 			_ = h.store.Update(inst)
-			respondError(w, "Failed to start container: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to start container: "+err.Error())
 			return
 		}
 	}
 
 	inst.Status = "running"
 	inst.ErrorMsg = ""
-	_ = h.store.Update(inst)
-	_ = h.proxy.Register(inst.ID, inst.Port)
+	if err := h.store.Update(inst); err != nil { // #9
+		log.Printf("Warning: failed to update instance %s: %v", inst.ID, err)
+	}
+	if err := h.proxy.Register(inst.ID, inst.Port); err != nil { // #9
+		log.Printf("Warning: failed to register proxy for %s: %v", inst.ID, err)
+	}
 
-	h.renderPartial(w, "instance_row", inst)
+	writeJSON(w, http.StatusOK, inst)
 }
 
-func (h *Handler) handleStopInstance(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiStopInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
 
 	if inst.ContainerID != "" && h.docker != nil {
-		// 使用 background context：停止容器不能依赖 request context，否则用户关闭浏览器会中断操作
-		if err := h.docker.StopContainer(context.Background(), inst.ContainerID); err != nil {
-			respondError(w, "Failed to stop container: "+err.Error())
+		if err := h.docker.StopContainer(r.Context(), inst.ContainerID); err != nil { // #7
+			writeError(w, http.StatusInternalServerError, "failed to stop container: "+err.Error())
 			return
 		}
 	}
 
 	inst.Status = "stopped"
-	_ = h.store.Update(inst)
+	if err := h.store.Update(inst); err != nil { // #9
+		log.Printf("Warning: failed to update instance %s: %v", inst.ID, err)
+	}
 	h.proxy.Unregister(id)
 
-	h.renderPartial(w, "instance_row", inst)
+	writeJSON(w, http.StatusOK, inst)
 }
 
-func (h *Handler) handleRestartInstance(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) apiRestartInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "instance not found")
 		return
 	}
 
 	if h.docker == nil {
-		respondError(w, "Docker is not available")
+		writeError(w, http.StatusInternalServerError, "docker is not available")
 		return
 	}
 
-	// Remove old container and recreate to trigger entrypoint (updates dependencies)
 	if inst.ContainerID != "" {
-		// 使用 background context：停止和删除容器不能依赖 request context，否则用户关闭浏览器会中断操作
-		_ = h.docker.StopContainer(context.Background(), inst.ContainerID)
-		_ = h.docker.RemoveContainer(context.Background(), inst.ContainerID)
+		// #24: log stop/remove errors instead of silently ignoring
+		if err := h.docker.StopContainer(r.Context(), inst.ContainerID); err != nil { // #7
+			log.Printf("Warning: failed to stop container %s during restart: %v", inst.ContainerID, err)
+		}
+		if err := h.docker.RemoveContainer(r.Context(), inst.ContainerID); err != nil { // #7, #24
+			log.Printf("Warning: failed to remove container %s during restart: %v", inst.ContainerID, err)
+		}
 	}
 
-	// 使用 background context：创建容器不能依赖 request context，否则用户关闭浏览器会中断操作
-	containerID, err := h.docker.CreateContainer(context.Background(), inst)
+	containerID, err := h.docker.CreateContainer(r.Context(), inst) // #7
 	if err != nil {
 		inst.Status = "error"
 		inst.ErrorMsg = err.Error()
-		_ = h.store.Update(inst)
-		respondError(w, "Failed to restart container: "+err.Error())
+		if updateErr := h.store.Update(inst); updateErr != nil { // #9
+			log.Printf("Warning: failed to update instance %s: %v", inst.ID, updateErr)
+		}
+		writeError(w, http.StatusInternalServerError, "failed to restart container: "+err.Error())
 		return
 	}
+
 	inst.ContainerID = containerID
-
 	inst.Status = "running"
-	_ = h.store.Update(inst)
-	_ = h.proxy.Register(inst.ID, inst.Port)
+	if err := h.store.Update(inst); err != nil { // #9
+		log.Printf("Warning: failed to update instance %s: %v", inst.ID, err)
+	}
+	if err := h.proxy.Register(inst.ID, inst.Port); err != nil { // #9
+		log.Printf("Warning: failed to register proxy for %s: %v", inst.ID, err)
+	}
 
-	h.renderPartial(w, "instance_row", inst)
+	writeJSON(w, http.StatusOK, inst)
+}
+
+func (h *Handler) apiInstanceStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inst, err := h.store.Get(id)
+	if err != nil {
+		// Instance deleted — return empty 200 so frontend removes it
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	clientStatus := r.URL.Query().Get("s")
+	if inst.ContainerID != "" && h.docker != nil {
+		if status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID); err == nil && status != inst.Status {
+			inst.Status = status
+			_ = h.store.Update(inst)
+		}
+	}
+
+	if inst.Status == clientStatus {
+		writeNoContent(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, inst)
+}
+
+// --- System API ---
+
+func (h *Handler) apiSystemResources(w http.ResponseWriter, r *http.Request) {
+	totalMemMB := hostMemoryMB()
+	writeJSON(w, http.StatusOK, map[string]int{
+		"total_memory_mb": totalMemMB,
+		"total_cpu_cores": runtime.NumCPU(),
+	})
+}
+
+// --- Settings API ---
+
+func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
+	// Env vars as ordered array (#21: log error, don't silently return empty)
+	envMap, envErr := h.config.GetEnvVars()
+	if envErr != nil {
+		log.Printf("Warning: failed to get env vars: %v", envErr)
+		envMap = map[string]string{}
+	}
+	type envVar struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	envVars := []envVar{}
+	for k, v := range envMap {
+		envVars = append(envVars, envVar{Key: k, Value: v})
+	}
+
+	// Config files with content
+	type configFile struct {
+		Name    string `json:"name"`
+		RelPath string `json:"rel_path"`
+		Hint    string `json:"hint"`
+		Content string `json:"content"`
+	}
+	var configFiles []configFile
+	for _, f := range h.config.EditableFiles() {
+		content, _ := h.config.ReadFile(f.RelPath)
+		configFiles = append(configFiles, configFile{
+			Name:    f.Name,
+			RelPath: f.RelPath,
+			Hint:    f.Hint,
+			Content: content,
+		})
+	}
+
+	// Dir files
+	type dirFile struct {
+		Name    string `json:"name"`
+		RelPath string `json:"rel_path"`
+	}
+	dirNames := []string{"commands", "agents", "skills", "plugins"}
+	dirs := map[string][]dirFile{}
+	for _, d := range dirNames {
+		files, _ := h.config.ListDirFiles(d)
+		arr := []dirFile{}
+		for _, f := range files {
+			arr = append(arr, dirFile{Name: f.Name, RelPath: f.RelPath})
+		}
+		dirs[d] = arr
+	}
+
+	// Agents skills
+	type agentsSkill struct {
+		SkillName string `json:"skill_name"`
+		RelPath   string `json:"rel_path"`
+	}
+	rawSkills, _ := h.config.ListAgentsSkills()
+	agentsSkills := []agentsSkill{}
+	for _, s := range rawSkills {
+		agentsSkills = append(agentsSkills, agentsSkill{SkillName: s.SkillName, RelPath: s.RelPath})
+	}
+
+	// Directory mappings
+	configDir := h.config.RootDir()
+	type dirMapping struct {
+		Host      string `json:"host"`
+		Container string `json:"container"`
+	}
+	mappings := []dirMapping{
+		{Host: filepath.Join(configDir, "opencode") + "/", Container: "/root/.config/opencode/"},
+		{Host: filepath.Join(configDir, "opencode-data", "auth.json"), Container: "/root/.local/share/opencode/auth.json"},
+		{Host: filepath.Join(configDir, "dot-opencode") + "/", Container: "/root/.opencode/"},
+		{Host: filepath.Join(configDir, "agents-skills") + "/", Container: "/root/.agents/"},
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"config_dir":          configDir,
+		"env_vars":            envVars,
+		"config_files":        configFiles,
+		"dirs":                dirs,
+		"agents_skills":       agentsSkills,
+		"directory_mappings":  mappings,
+	})
+}
+
+func (h *Handler) apiSaveEnvVars(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit (#17)
+	var req struct {
+		Vars []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"vars"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	env := make(map[string]string)
+	for _, v := range req.Vars {
+		k := strings.TrimSpace(v.Key)
+		if k == "" {
+			continue
+		}
+		env[k] = v.Value // #14: preserve value as-is, do not trim spaces
+	}
+
+	if err := h.config.SetEnvVars(env); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save environment variables: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiGetConfigFile(w http.ResponseWriter, r *http.Request) {
+	relPath := r.URL.Query().Get("path")
+	if relPath == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	content, err := h.config.ReadFile(relPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read file: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"rel_path": relPath,
+		"content":  content,
+	})
+}
+
+func (h *Handler) apiSaveConfigFile(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB limit (#17)
+	var req struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Path == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	if err := h.config.WriteFile(req.Path, req.Content); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save file: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiListDirFiles(w http.ResponseWriter, r *http.Request) {
+	dirName := r.URL.Query().Get("dir")
+	if dirName == "" {
+		writeError(w, http.StatusBadRequest, "dir is required")
+		return
+	}
+	files, err := h.config.ListDirFiles(dirName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list files: "+err.Error())
+		return
+	}
+	type dirFile struct {
+		Name    string `json:"name"`
+		RelPath string `json:"rel_path"`
+	}
+	result := []dirFile{}
+	for _, f := range files {
+		result = append(result, dirFile{Name: f.Name, RelPath: f.RelPath})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) apiSaveDirFile(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10 MB limit (#17)
+	var req struct {
+		Dir      string `json:"dir"`
+		Filename string `json:"filename"`
+		Content  string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Dir == "" || req.Filename == "" {
+		writeError(w, http.StatusBadRequest, "dir and filename are required")
+		return
+	}
+	relPath := filepath.Join(config.DirOpenCodeConfig, req.Dir, req.Filename)
+	if err := h.config.WriteFile(relPath, req.Content); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save file: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiDeleteDirFile(w http.ResponseWriter, r *http.Request) {
+	relPath := r.URL.Query().Get("path")
+	if relPath == "" {
+		writeError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+	if err := h.config.DeleteFile(relPath); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete file: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiDeleteAgentsSkill(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if err := h.config.DeleteAgentsSkill(name); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete skill: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+// --- WebSocket handlers (unchanged) ---
+
+var wsUpgrader = websocket.Upgrader{
+	// Allow same-host connections only. When Origin header is absent (e.g. native
+	// WebSocket clients / curl) we also allow, matching the net/http default.
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		// Accept if Origin matches the Host header (scheme-insensitive).
+		host := r.Host
+		return strings.EqualFold(strings.TrimPrefix(strings.TrimPrefix(origin, "https://"), "http://"), host)
+	},
 }
 
 func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +734,8 @@ func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			if writeErr := conn.WriteMessage(websocket.TextMessage, buf[:n]); writeErr != nil {
+			// #10: use BinaryMessage for raw log bytes (may contain ANSI codes)
+			if writeErr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
 				return
 			}
 		}
@@ -475,337 +745,6 @@ func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-func (h *Handler) handleInstanceStatus(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	inst, err := h.store.Get(id)
-	if err != nil {
-		// Instance was deleted — return empty body so hx-swap="outerHTML" removes the row silently
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// The frontend passes its currently displayed status via ?s= query param.
-	// We compare against that instead of the DB status so the frontend always
-	// converges to the true state (fixes restart showing stale "removed").
-	clientStatus := r.URL.Query().Get("s")
-	if inst.ContainerID != "" && h.docker != nil {
-		if status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID); err == nil {
-			if status != inst.Status {
-				inst.Status = status
-				_ = h.store.Update(inst)
-			}
-		}
-	}
-
-	if inst.Status == clientStatus {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	h.renderPartial(w, "instance_row", inst)
-}
-
-const instanceCookieName = "_cc_inst"
-
-func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	http.SetCookie(w, &http.Cookie{
-		Name:     instanceCookieName,
-		Value:    id,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-	h.proxy.ServeHTTP(w, r, id)
-}
-
-func (h *Handler) handleCatchAll(w http.ResponseWriter, r *http.Request) {
-	instanceID := h.resolveInstanceID(r)
-	if instanceID == "" {
-		http.NotFound(w, r)
-		return
-	}
-
-	h.proxy.ServeHTTPDirect(w, r, instanceID)
-}
-
-func (h *Handler) resolveInstanceID(r *http.Request) string {
-	if id := extractInstanceIDFromReferer(r); id != "" {
-		return id
-	}
-	if c, err := r.Cookie(instanceCookieName); err == nil && c.Value != "" {
-		return c.Value
-	}
-	return ""
-}
-
-func extractInstanceIDFromReferer(r *http.Request) string {
-	referer := r.Header.Get("Referer")
-	if referer == "" {
-		return ""
-	}
-
-	const prefix = "/instance/"
-	idx := strings.Index(referer, prefix)
-	if idx == -1 {
-		return ""
-	}
-
-	rest := referer[idx+len(prefix):]
-	slashIdx := strings.Index(rest, "/")
-	if slashIdx == -1 {
-		return ""
-	}
-	return rest[:slashIdx]
-}
-
-func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
-	envVars, _ := h.config.GetEnvVars()
-	files := h.config.EditableFiles()
-
-	type fileData struct {
-		Name    string
-		RelPath string
-		Hint    string
-		Content string
-	}
-
-	var editableFiles []fileData
-	for _, f := range files {
-		content, _ := h.config.ReadFile(f.RelPath)
-		editableFiles = append(editableFiles, fileData{
-			Name:    f.Name,
-			RelPath: f.RelPath,
-			Hint:    f.Hint,
-			Content: content,
-		})
-	}
-
-	type dirSection struct {
-		Name  string
-		Hint  string
-		Files []config.DirFileInfo
-	}
-
-	dirDefs := []struct {
-		name string
-		hint string
-	}{
-		{"commands", "Custom commands (.md files), mounted at ~/.config/opencode/commands/"},
-		{"agents", "Custom agents (.md files), mounted at ~/.config/opencode/agents/"},
-		{"skills", "Agent skills (<name>/SKILL.md), mounted at ~/.config/opencode/skills/"},
-		{"plugins", "Local plugins (.js/.ts files), mounted at ~/.config/opencode/plugins/"},
-	}
-
-	var dirs []dirSection
-	for _, d := range dirDefs {
-		dirFiles, _ := h.config.ListDirFiles(d.name)
-		dirs = append(dirs, dirSection{
-			Name:  d.name,
-			Hint:  d.hint,
-			Files: dirFiles,
-		})
-	}
-
-	agentsSkills, _ := h.config.ListAgentsSkills()
-
-	data := map[string]interface{}{
-		"Title":        "CloudCode - Settings",
-		"EnvVars":      envVars,
-		"Files":        editableFiles,
-		"Dirs":         dirs,
-		"AgentsSkills": agentsSkills,
-		"ConfigDir":    h.config.RootDir(),
-	}
-	h.render(w, "settings", data)
-}
-
-func (h *Handler) handleSaveEnvVars(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	env := make(map[string]string)
-	keys := r.Form["env_key"]
-	values := r.Form["env_value"]
-	for i, k := range keys {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			continue
-		}
-		v := ""
-		if i < len(values) {
-			v = strings.TrimSpace(values[i])
-		}
-		env[k] = v
-	}
-
-	if err := h.config.SetEnvVars(env); err != nil {
-		respondError(w, "Failed to save environment variables: "+err.Error())
-		return
-	}
-
-	w.Header().Set("HX-Redirect", "/settings")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) handleGetConfigFile(w http.ResponseWriter, r *http.Request) {
-	relPath := r.URL.Query().Get("path")
-	if relPath == "" {
-		http.Error(w, "path is required", http.StatusBadRequest)
-		return
-	}
-	content, err := h.config.ReadFile(relPath)
-	if err != nil {
-		http.Error(w, "Failed to read file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, content)
-}
-
-func (h *Handler) handleSaveConfigFile(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	relPath := r.FormValue("path")
-	content := r.FormValue("content")
-	if relPath == "" {
-		http.Error(w, "path is required", http.StatusBadRequest)
-		return
-	}
-
-	if err := h.config.WriteFile(relPath, content); err != nil {
-		respondError(w, "Failed to save file: "+err.Error())
-		return
-	}
-
-	w.Header().Set("HX-Redirect", "/settings")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) handleListDirFiles(w http.ResponseWriter, r *http.Request) {
-	dirName := r.URL.Query().Get("dir")
-	if dirName == "" {
-		http.Error(w, "dir is required", http.StatusBadRequest)
-		return
-	}
-
-	files, err := h.config.ListDirFiles(dirName)
-	if err != nil {
-		http.Error(w, "Failed to list files: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(files)
-}
-
-func (h *Handler) handleSaveDirFile(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	dir := r.FormValue("dir")
-	filename := r.FormValue("filename")
-	content := r.FormValue("content")
-	if dir == "" || filename == "" {
-		http.Error(w, "dir and filename are required", http.StatusBadRequest)
-		return
-	}
-
-	relPath := filepath.Join(config.DirOpenCodeConfig, dir, filename)
-	if err := h.config.WriteFile(relPath, content); err != nil {
-		respondError(w, "Failed to save file: "+err.Error())
-		return
-	}
-
-	w.Header().Set("HX-Redirect", "/settings")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) handleDeleteDirFile(w http.ResponseWriter, r *http.Request) {
-	relPath := r.URL.Query().Get("path")
-	if relPath == "" {
-		http.Error(w, "path is required", http.StatusBadRequest)
-		return
-	}
-
-	if err := h.config.DeleteFile(relPath); err != nil {
-		respondError(w, "Failed to delete file: "+err.Error())
-		return
-	}
-
-	w.Header().Set("HX-Redirect", "/settings")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) handleDeleteAgentsSkill(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-	if name == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
-		return
-	}
-
-	if err := h.config.DeleteAgentsSkill(name); err != nil {
-		respondError(w, "Failed to delete skill: "+err.Error())
-		return
-	}
-
-	w.Header().Set("HX-Redirect", "/settings")
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *Handler) render(w http.ResponseWriter, name string, data interface{}) {
-	t, ok := h.tmpls[name]
-	if !ok {
-		log.Printf("Template not found: %s", name)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := t.ExecuteTemplate(w, "base", data); err != nil {
-		log.Printf("Template render error (%s): %v", name, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
-}
-
-func (h *Handler) renderPartial(w http.ResponseWriter, name string, data interface{}) {
-	t, ok := h.tmpls[name]
-	if !ok {
-		log.Printf("Partial template not found: %s", name)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := t.ExecuteTemplate(w, name, data); err != nil {
-		log.Printf("Partial render error (%s): %v", name, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
-}
-
-var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func (h *Handler) handleTerminalPage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	inst, err := h.store.Get(id)
-	if err != nil {
-		http.Error(w, "Instance not found", http.StatusNotFound)
-		return
-	}
-
-	data := map[string]interface{}{
-		"Instance": inst,
-		"Title":    fmt.Sprintf("CloudCode - %s Terminal", inst.Name),
-	}
-	h.render(w, "terminal", data)
 }
 
 func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
@@ -828,7 +767,9 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	ctx := r.Context()
+	// #11: use a shared context so both goroutines can signal each other to stop
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 
 	execID, err := h.docker.ExecCreate(ctx, inst.ContainerID, []string{"/bin/bash", "-l"})
 	if err != nil {
@@ -845,6 +786,7 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 
 	done := make(chan struct{})
 
+	// goroutine: container → WebSocket
 	go func() {
 		defer close(done)
 		buf := make([]byte, 4096)
@@ -852,10 +794,12 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			n, err := hijacked.Reader.Read(buf)
 			if n > 0 {
 				if writeErr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
+					cancel() // #11: signal reader goroutine to stop
 					return
 				}
 			}
 			if err != nil {
+				cancel() // #11
 				return
 			}
 		}
@@ -867,14 +811,15 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		Rows uint   `json:"rows"`
 	}
 
+	// goroutine: WebSocket → container
 	go func() {
 		for {
 			msgType, msg, err := conn.ReadMessage()
 			if err != nil {
 				_ = hijacked.CloseWrite()
+				cancel() // #11: signal writer goroutine to stop
 				return
 			}
-
 			if msgType == websocket.TextMessage && len(msg) > 0 && msg[0] == '{' {
 				var rm resizeMsg
 				if json.Unmarshal(msg, &rm) == nil && rm.Type == "resize" {
@@ -882,8 +827,8 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-
 			if _, err := hijacked.Conn.Write(msg); err != nil {
+				cancel() // #11
 				return
 			}
 		}
@@ -892,7 +837,72 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	<-done
 }
 
-func respondError(w http.ResponseWriter, msg string) {
+// --- Proxy handlers (unchanged) ---
+
+const instanceCookieName = "_cc_inst"
+
+func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	http.SetCookie(w, &http.Cookie{
+		Name:     instanceCookieName,
+		Value:    id,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil, // #18: set Secure flag when serving over HTTPS
+		SameSite: http.SameSiteLaxMode,
+	})
+	h.proxy.ServeHTTP(w, r, id)
+}
+
+func (h *Handler) handleCatchAll(w http.ResponseWriter, r *http.Request) {
+	// If it's an API path that wasn't matched, return 404 JSON
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	// Check if this is a proxied asset request (Referer or cookie based)
+	instanceID := h.resolveInstanceID(r)
+	if instanceID != "" {
+		h.proxy.ServeHTTPDirect(w, r, instanceID)
+		return
+	}
+
+	// #23: serve frontend SPA index.html without redirects
+	spaPath := filepath.Join("frontend", "dist", "index.html")
+	data, err := os.ReadFile(spaPath)
+	if err != nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<div class="alert alert-error">%s</div>`, template.HTMLEscapeString(msg))
+	_, _ = w.Write(data)
+}
+
+func (h *Handler) resolveInstanceID(r *http.Request) string {
+	if id := extractInstanceIDFromReferer(r); id != "" {
+		return id
+	}
+	if c, err := r.Cookie(instanceCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	return ""
+}
+
+func extractInstanceIDFromReferer(r *http.Request) string {
+	referer := r.Header.Get("Referer")
+	if referer == "" {
+		return ""
+	}
+	const prefix = "/instance/"
+	idx := strings.Index(referer, prefix)
+	if idx == -1 {
+		return ""
+	}
+	rest := referer[idx+len(prefix):]
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx == -1 {
+		return ""
+	}
+	return rest[:slashIdx]
 }

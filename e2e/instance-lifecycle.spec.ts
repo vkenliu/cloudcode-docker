@@ -7,6 +7,10 @@ async function createInstance(page: import('@playwright/test').Page, name: strin
   await expect(page).toHaveURL('/', { timeout: 30000 });
 }
 
+function instanceCard(page: import('@playwright/test').Page, name: string) {
+  return page.locator(`.instance-card:has-text("${name}")`);
+}
+
 test.describe('Instance Lifecycle', () => {
   test.describe('Create Instance', () => {
     test('should show loading state on create button when submitting', async ({ page }) => {
@@ -37,8 +41,8 @@ test.describe('Instance Lifecycle', () => {
       const name = 'test-create-' + Date.now();
       await createInstance(page, name);
 
-      const row = page.locator(`tr:has-text("${name}")`);
-      await expect(row).toBeVisible({ timeout: 5000 });
+      const card = instanceCard(page, name);
+      await expect(card).toBeVisible({ timeout: 5000 });
     });
 
     test('should reject duplicate instance names', async ({ page }) => {
@@ -59,10 +63,10 @@ test.describe('Instance Lifecycle', () => {
       const name = 'test-spinner-' + Date.now();
       await createInstance(page, name);
 
-      const row = page.locator(`tr:has-text("${name}")`);
-      await expect(row).toBeVisible({ timeout: 5000 });
+      const card = instanceCard(page, name);
+      await expect(card).toBeVisible({ timeout: 5000 });
 
-      const spinners = row.locator('.spinner');
+      const spinners = card.locator('.spinner');
       const count = await spinners.count();
       expect(count).toBeGreaterThan(0);
 
@@ -77,27 +81,27 @@ test.describe('Instance Lifecycle', () => {
       const name = 'test-delete-' + Date.now();
       await createInstance(page, name);
 
-      const row = page.locator(`tr:has-text("${name}")`);
-      await expect(row).toBeVisible({ timeout: 5000 });
+      const card = instanceCard(page, name);
+      await expect(card).toBeVisible({ timeout: 5000 });
 
       page.on('dialog', dialog => dialog.accept());
 
-      const deleteBtn = row.getByRole('button', { name: /Delete/i });
+      const deleteBtn = card.getByRole('button', { name: /Del/i });
       await deleteBtn.click();
 
-      await expect(row).toHaveCount(0, { timeout: 15000 });
+      await expect(card).toHaveCount(0, { timeout: 15000 });
     });
 
     test('should not show "instance not found" toast after deletion', async ({ page }) => {
       const name = 'test-no-toast-' + Date.now();
       await createInstance(page, name);
 
-      const row = page.locator(`tr:has-text("${name}")`);
-      await expect(row).toBeVisible({ timeout: 5000 });
+      const card = instanceCard(page, name);
+      await expect(card).toBeVisible({ timeout: 5000 });
 
       page.on('dialog', dialog => dialog.accept());
 
-      const deleteBtn = row.getByRole('button', { name: /Delete/i });
+      const deleteBtn = card.getByRole('button', { name: /Del/i });
       await deleteBtn.click();
 
       await page.waitForTimeout(12000);
@@ -114,12 +118,12 @@ test.describe('Instance Lifecycle', () => {
       const name = 'test-no-err-' + Date.now();
       await createInstance(page, name);
 
-      const row = page.locator(`tr:has-text("${name}")`);
-      await expect(row).toBeVisible({ timeout: 5000 });
+      const card = instanceCard(page, name);
+      await expect(card).toBeVisible({ timeout: 5000 });
 
       page.on('dialog', dialog => dialog.accept());
 
-      const deleteBtn = row.getByRole('button', { name: /Delete/i });
+      const deleteBtn = card.getByRole('button', { name: /Del/i });
       await deleteBtn.click();
 
       await page.waitForTimeout(3000);

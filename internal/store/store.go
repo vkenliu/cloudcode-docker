@@ -177,11 +177,16 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// scanInstance scans a single row into an Instance.
-func scanInstance(row *sql.Row) (*Instance, error) {
+// rowScanner is satisfied by both *sql.Row and *sql.Rows (#19).
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanInstanceFrom scans a single row (from *sql.Row or *sql.Rows) into an Instance.
+func scanInstanceFrom(s rowScanner) (*Instance, error) {
 	var inst Instance
 	var envJSON string
-	if err := row.Scan(&inst.ID, &inst.Name, &inst.ContainerID, &inst.Status, &inst.ErrorMsg, &inst.Port, &inst.WorkDir, &envJSON, &inst.MemoryMB, &inst.CPUCores, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
+	if err := s.Scan(&inst.ID, &inst.Name, &inst.ContainerID, &inst.Status, &inst.ErrorMsg, &inst.Port, &inst.WorkDir, &envJSON, &inst.MemoryMB, &inst.CPUCores, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(envJSON), &inst.EnvVars); err != nil {
@@ -190,15 +195,12 @@ func scanInstance(row *sql.Row) (*Instance, error) {
 	return &inst, nil
 }
 
-// scanInstanceRow scans from sql.Rows.
+// scanInstance scans a single *sql.Row into an Instance.
+func scanInstance(row *sql.Row) (*Instance, error) {
+	return scanInstanceFrom(row)
+}
+
+// scanInstanceRow scans from *sql.Rows.
 func scanInstanceRow(rows *sql.Rows) (*Instance, error) {
-	var inst Instance
-	var envJSON string
-	if err := rows.Scan(&inst.ID, &inst.Name, &inst.ContainerID, &inst.Status, &inst.ErrorMsg, &inst.Port, &inst.WorkDir, &envJSON, &inst.MemoryMB, &inst.CPUCores, &inst.CreatedAt, &inst.UpdatedAt); err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal([]byte(envJSON), &inst.EnvVars); err != nil {
-		return nil, fmt.Errorf("unmarshal env vars: %w", err)
-	}
-	return &inst, nil
+	return scanInstanceFrom(rows)
 }

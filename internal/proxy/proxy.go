@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -33,10 +34,9 @@ func New() *ReverseProxy {
 }
 
 // Register adds or updates a proxy route for an instance.
-// Traffic is routed via Docker network using container name (cloudcode-{id}).
+// Traffic is routed via the published port on localhost.
 func (rp *ReverseProxy) Register(instanceID string, port int) error {
-	containerName := fmt.Sprintf("cloudcode-%s", instanceID)
-	target, err := url.Parse(fmt.Sprintf("http://%s:%d", containerName, port))
+	target, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
 	if err != nil {
 		return fmt.Errorf("parse target URL: %w", err)
 	}
@@ -139,10 +139,16 @@ func generateNonce() string {
 }
 
 func injectInstanceIsolation(instanceID string) func(*http.Response) error {
+	idJSON, err := json.Marshal(instanceID)
+	if err != nil {
+		// instanceID is always a short alphanumeric string, this should never fail.
+		// Fall back to a safe empty string to avoid injecting unescaped data.
+		idJSON = []byte(`""`)
+	}
 	scriptBody := `
 (function() {
   var K = "_cc_active_inst";
-  var ID = "` + instanceID + `";
+  var ID = ` + string(idJSON) + `;
   var SK = "_cc_store_" + ID;
 
   function isShared(n) {

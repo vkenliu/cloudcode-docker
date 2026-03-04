@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	"net/netip"
+
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
@@ -91,12 +93,14 @@ func (m *Manager) ensureImage(ctx context.Context) error {
 }
 
 func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// #16: pull/check image before acquiring the global mutex to avoid blocking
+	// other operations (status checks, etc.) during a potentially long image pull.
 	if err := m.ensureImage(ctx); err != nil {
 		return "", fmt.Errorf("ensure image: %w", err)
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	containerName := containerPrefix + inst.ID
 
@@ -139,6 +143,11 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 		}
 	}
 
+	containerPort, err := network.ParsePort(fmt.Sprintf("%d/tcp", inst.Port))
+	if err != nil {
+		return "", fmt.Errorf("parse container port: %w", err)
+	}
+	hostIP := netip.MustParseAddr("127.0.0.1")
 	resp, err := m.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: containerName,
 		Config: &container.Config{
@@ -149,6 +158,9 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				labelManaged: "true",
 				labelInstID:  inst.ID,
 			},
+			ExposedPorts: network.PortSet{
+				containerPort: struct{}{},
+			},
 		},
 		HostConfig: &container.HostConfig{
 			Mounts: mounts,
@@ -156,6 +168,11 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				Name: "unless-stopped",
 			},
 			Resources: inst.ContainerResources(),
+			PortBindings: network.PortMap{
+				containerPort: []network.PortBinding{
+					{HostIP: hostIP, HostPort: fmt.Sprintf("%d", inst.Port)},
+				},
+			},
 		},
 		NetworkingConfig: &network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{

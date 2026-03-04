@@ -1,16 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
+	"time"
 
 	"github.com/naiba/cloudcode/internal/config"
 	"github.com/naiba/cloudcode/internal/docker"
@@ -27,8 +25,11 @@ func main() {
 		dataDir  = flag.String("data", "./data", "Data directory for SQLite database")
 		imgName  = flag.String("image", "ghcr.io/naiba/cloudcode-base:latest", "Docker image name for opencode instances")
 		noDocker = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
+		corsOrigin = flag.String("cors-origin", "", "Allowed CORS origin for dev (e.g. http://localhost:3000)")
 	)
 	flag.Parse()
+
+	_ = version
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting CloudCode Management Platform...")
@@ -64,31 +65,37 @@ func main() {
 	}
 
 	rp := proxy.New()
+	h := handler.New(db, dm, rp, cfgMgr)
 
-	tmpl, err := loadTemplates()
-	if err != nil {
-		log.Fatalf("Failed to load templates: %v", err)
+	mux := http.NewServeMux()
+
+	// CORS middleware for development
+	var rootHandler http.Handler = mux
+	if *corsOrigin != "" {
+		log.Printf("CORS enabled for origin: %s", *corsOrigin)
+		rootHandler = corsMiddleware(*corsOrigin, mux)
 	}
 
-	h := handler.New(db, dm, rp, cfgMgr, tmpl)
-
-	// Setup routes
-	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 
-	// Start server
 	server := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
+		Addr:              *addr,
+		Handler:           rootHandler,
+		ReadHeaderTimeout: 10 * time.Second, // #22: prevent Slowloris attacks
+		IdleTimeout:       120 * time.Second, // #22: reclaim idle connections
 	}
 
-	// Graceful shutdown
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down...")
-		server.Close()
+		// #8: graceful shutdown with timeout instead of server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Shutdown error: %v", err)
+		}
 	}()
 
 	log.Printf("CloudCode listening on %s", *addr)
@@ -97,71 +104,15 @@ func main() {
 	}
 }
 
-func loadTemplates() (map[string]*template.Template, error) {
-	funcMap := template.FuncMap{
-		"version":  func() string { return version },
-		"contains": strings.Contains,
-		"statusColor": func(status string) string {
-			switch status {
-			case "running":
-				return "green"
-			case "stopped", "exited":
-				return "gray"
-			case "error":
-				return "red"
-			case "created":
-				return "blue"
-			default:
-				return "yellow"
-			}
-		},
-		"statusBadge": func(status string) string {
-			switch status {
-			case "running":
-				return "badge-success"
-			case "stopped", "exited":
-				return "badge-secondary"
-			case "error":
-				return "badge-danger"
-			case "created":
-				return "badge-info"
-			default:
-				return "badge-warning"
-			}
-		},
-	}
-
-	shared := []string{
-		filepath.Join("templates", "layouts", "base.html"),
-		filepath.Join("templates", "partials", "instance_row.html"),
-	}
-
-	pages, err := filepath.Glob(filepath.Join("templates", "*.html"))
-	if err != nil {
-		return nil, fmt.Errorf("glob pages: %w", err)
-	}
-
-	tmpls := make(map[string]*template.Template)
-
-	for _, page := range pages {
-		name := strings.TrimSuffix(filepath.Base(page), ".html")
-		files := append([]string{page}, shared...)
-		t, err := template.New(name).Funcs(funcMap).ParseFiles(files...)
-		if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", page, err)
+func corsMiddleware(origin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
-		tmpls[name] = t
-	}
-
-	partials, _ := filepath.Glob(filepath.Join("templates", "partials", "*.html"))
-	for _, p := range partials {
-		name := strings.TrimSuffix(filepath.Base(p), ".html")
-		t, err := template.New(name).Funcs(funcMap).ParseFiles(p)
-		if err != nil {
-			return nil, fmt.Errorf("parse partial %s: %w", p, err)
-		}
-		tmpls[name] = t
-	}
-
-	return tmpls, nil
+		next.ServeHTTP(w, r)
+	})
 }
