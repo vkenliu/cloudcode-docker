@@ -3,18 +3,18 @@
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev)
 [![Docker](https://img.shields.io/badge/Docker-Required-2496ED?logo=docker)](https://www.docker.com)
 
-A self-hosted management platform for [Claude Code](https://claude.ai/code) instances. Spin up multiple isolated Claude Code environments as Docker containers and manage them through a single web dashboard.
+A self-hosted management platform for [OpenCode](https://opencode.ai) instances. Spin up multiple isolated OpenCode environments as Docker containers and manage them through a single web dashboard.
 
 ## Features
 
-- **Multi-instance management** — Create, start, stop, restart, and delete Claude Code instances
+- **Multi-instance management** — Create, start, stop, restart, and delete OpenCode instances
 - **Configurable resource limits** — Set memory and CPU limits per instance at creation time, or leave unlimited
 - **Session isolation** — Each instance has its own workspace; auth tokens are shared globally
-- **Shared global config** — Manage `Claude.jsonc`, `AGENTS.md`, auth tokens, custom commands, agents, skills, and plugins from a unified Settings UI
+- **Shared global config** — Manage `opencode.jsonc`, `AGENTS.md`, auth tokens, custom commands, agents, skills, and plugins from a unified Settings UI
 - **skills.sh integration** — Install [skills.sh](https://skills.sh) skills inside any container, shared across all instances
 - **Telegram notifications** — Built-in plugin sends Telegram messages on task completion/error
 - **Reverse proxy** — Access each instance's Web UI through a single entry point (`/instance/{id}/`)
-- **Auto-updating containers** — Claude Code + Oh My Claude updated on each container start
+- **Auto-updating containers** — OpenCode + Oh My OpenCode updated on each container start
 - **System prompt watchdog** — Automatically filters temporal lines (dates/timestamps) injected into system prompts; alerts on structural changes via Telegram with unified diff
 - **Cloudflare Tunnel built-in** — Each container ships with `cloudflared` pre-installed; expose any local service to the public internet with a single command, no port forwarding needed
 - **Playwright Chromium** — Pre-installed in each container with symlinks at `/usr/bin/chromium-browser` and `/usr/bin/chrome`
@@ -46,8 +46,8 @@ Browser → CloudCode Platform (Go JSON API + Next.js frontend)
                               ┌────────────┼────────────┐
                               ▼            ▼            ▼
                          Container 1  Container 2  Container N
-                         (claude web  (claude web  (claude web
-                          :10000)      :10001)      :10002)
+                         (opencode    (opencode    (opencode
+                          web :10000)  web :10001)  web :10002)
 ```
 
 ```
@@ -58,11 +58,11 @@ internal/
   docker/manager.go              Docker container lifecycle (create/start/stop/delete)
   handler/handler.go             All HTTP handlers (JSON REST API)
   handler/memory_*.go            Platform-specific host memory detection
-  proxy/proxy.go                 Dynamic reverse proxy to each instance's Claude web UI
+  proxy/proxy.go                 Dynamic reverse proxy to each instance's OpenCode web UI
   store/store.go                 SQLite persistence (instance CRUD)
 docker/
-  Dockerfile                     Base image (Ubuntu 24.04 + Go + Node 22 + Bun + Claude Code)
-  entrypoint.sh                  Container startup script (updates deps + starts claude web)
+  Dockerfile                     Base image (Ubuntu 24.04 + Go + Node 22 + Bun + OpenCode)
+  entrypoint.sh                  Container startup script (updates deps + starts opencode web)
 Dockerfile.platform              Multi-stage build for the platform itself
 frontend/                        Next.js 16 App Router frontend (TypeScript + Tailwind)
   app/                           Pages: dashboard, instance detail, terminal, settings, new instance
@@ -70,7 +70,7 @@ frontend/                        Next.js 16 App Router frontend (TypeScript + Ta
   lib/api.ts                     Typed API client + WebSocket helpers
 ```
 
-Each container runs `claude web` and is accessible through the platform's reverse proxy.
+Each container runs `opencode web` and is accessible through the platform's reverse proxy.
 
 ## Configuration
 
@@ -78,9 +78,9 @@ Global config is managed through the Settings page and bind-mounted into all con
 
 | Storage | Container Path | Scope | Contents |
 |---|---|---|---|
-| `data/config/Claude/` | `/root/.config/Claude/` | Global | `Claude.jsonc`, `AGENTS.md`, `package.json`, commands/, agents/, skills/, plugins/ |
-| `data/config/Claude-data/auth.json` | `/root/.local/share/Claude/auth.json` | Global | Auth tokens (shared across all instances) |
-| `data/config/dot-Claude/` | `/root/.Claude/` | Global | `package.json` |
+| `data/config/opencode/` | `/root/.config/opencode/` | Global | `opencode.jsonc`, `AGENTS.md`, `package.json`, commands/, agents/, skills/, plugins/ |
+| `data/config/opencode-data/auth.json` | `/root/.local/share/opencode/auth.json` | Global | Auth tokens (shared across all instances) |
+| `data/config/dot-opencode/` | `/root/.opencode/` | Global | `package.json` |
 | `data/config/agents-skills/` | `/root/.agents/` | Global | Skills installed via [skills.sh](https://skills.sh) |
 | `cloudcode-home-{id}` (volume) | `/root` | Per-instance | Workspace, cloned repos, session data |
 
@@ -127,7 +127,7 @@ Configure via environment variables:
 - **Backend**: Go 1.25, `net/http` stdlib router, SQLite (via `modernc.org/sqlite`, pure Go no CGO)
 - **Frontend**: Next.js 16 App Router, TypeScript, Tailwind CSS v4, xterm.js for terminal
 - **Containers**: Docker SDK (`github.com/moby/moby/client`)
-- **Base Image**: Ubuntu 24.04 + Go + Node 22 + Bun + Claude Code + Oh My Claude
+- **Base Image**: Ubuntu 24.04 + Go + Node 22 + Bun + OpenCode + Oh My OpenCode
 
 ## Development
 
