@@ -184,12 +184,18 @@ function InstanceCard({
           >
             Logs
           </button>
-          <Link
-            href={`/instances/${instance.id}/terminal`}
-            className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-slate-200"
-          >
-            Terminal
-          </Link>
+          {isRunning ? (
+            <Link
+              href={`/instances/${instance.id}/terminal`}
+              className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-slate-200"
+            >
+              Terminal
+            </Link>
+          ) : (
+            <span className="px-3 py-1 text-xs bg-slate-700 rounded text-slate-500 cursor-not-allowed">
+              Terminal
+            </span>
+          )}
           <button
             disabled={busy}
             onClick={doDelete}

@@ -163,6 +163,7 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 		}
 	}
 
+	exposedPort := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
 	resp, err := m.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: containerName,
 		Config: &container.Config{
@@ -172,6 +173,10 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 			Labels: map[string]string{
 				labelManaged: "true",
 				labelInstID:  inst.ID,
+			},
+			// ExposedPorts is required for Docker to honour PortBindings.
+			ExposedPorts: network.PortSet{
+				exposedPort: struct{}{},
 			},
 		},
 		HostConfig: &container.HostConfig{
@@ -186,7 +191,7 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 			// routes through 127.0.0.1:<hostPort>, which is reliable regardless of
 			// what address opencode binds to inside the container.
 			PortBindings: network.PortMap{
-				network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort)): []network.PortBinding{
+				exposedPort: []network.PortBinding{
 					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "0"},
 				},
 			},

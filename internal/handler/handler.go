@@ -149,8 +149,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /instances/{id}/logs/ws", h.handleLogsWS)
 	mux.HandleFunc("GET /instances/{id}/terminal/ws", h.handleTerminalWS)
 
-	// --- Reverse proxy to OpenCode web UI (protected) ---
-	mux.Handle("/instance/{id}/", h.auth(http.HandlerFunc(h.handleProxy)))
+	// --- Reverse proxy to OpenCode web UI ---
+	// No platform session required — handleProxy validates the per-instance
+	// access token (cookie, ?token=, or Authorization: Bearer) itself.
+	mux.HandleFunc("/instance/{id}/", h.handleProxy)
 
 	// --- Catch-all: SPA asset fallback / proxy fallback (must be last) ---
 	// Public for /login route (SPA handles it); protected for all other paths.
@@ -1338,19 +1340,13 @@ func (h *Handler) handleCatchAll(w http.ResponseWriter, r *http.Request) {
 	// /login is always public — serve the SPA so it can render the login page.
 	isLoginPage := r.URL.Path == "/login" || r.URL.Path == "/login/"
 
-	// H2: check auth before proxying catch-all instance assets.
-	if !isLoginPage && !h.isAuthenticated(r) {
-		if instanceID := h.resolveInstanceID(r); instanceID != "" {
-			writeError(w, http.StatusUnauthorized, "authentication required")
-			return
-		}
-		http.Redirect(w, r, "/login", http.StatusFound)
-		return
-	}
-
-	// Proxied asset request (Referer or cookie based) — only for authenticated users.
-	if h.isAuthenticated(r) {
-		if instanceID := h.resolveInstanceID(r); instanceID != "" {
+	// Proxied asset request (Referer or cookie based).
+	// Allow through if either:
+	//   (a) the user has a valid platform session, OR
+	//   (b) the request carries a valid per-instance token cookie
+	//       (covers SPA assets loaded after the ?token= redirect, no session needed).
+	if instanceID := h.resolveInstanceID(r); instanceID != "" {
+		if h.isAuthenticated(r) || h.proxy.ValidateToken(r, instanceID) {
 			// Validate the per-instance token (via cookie) before forwarding.
 			if !h.proxy.ValidateToken(r, instanceID) {
 				writeError(w, http.StatusUnauthorized, "instance token required")
@@ -1359,6 +1355,15 @@ func (h *Handler) handleCatchAll(w http.ResponseWriter, r *http.Request) {
 			h.proxy.ServeHTTPDirect(w, r, instanceID)
 			return
 		}
+		// Instance path but no valid auth at all.
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	// Non-instance path: require platform session (except /login).
+	if !isLoginPage && !h.isAuthenticated(r) {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
 	}
 
 	// Serve the embedded SPA for all other paths.
