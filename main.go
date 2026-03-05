@@ -95,11 +95,17 @@ func main() {
 	server := &http.Server{
 		Addr:              *addr,
 		Handler:           rootHandler,
-		ReadHeaderTimeout: 10 * time.Second,  // prevent Slowloris header attacks
-		ReadTimeout:       30 * time.Second,  // limit slow-body attacks
-		WriteTimeout:      120 * time.Second, // generous for streaming (logs/terminal WS handshake)
-		IdleTimeout:       120 * time.Second, // reclaim idle connections
+		ReadHeaderTimeout: 10 * time.Second, // prevent Slowloris header attacks
+		ReadTimeout:       30 * time.Second, // limit slow-body attacks
+		// C4: WriteTimeout must be 0 for WebSocket connections — the server
+		// hijacks the connection and a non-zero WriteTimeout would tear down
+		// idle terminal/log streams after the deadline.  Per-write deadlines
+		// are set inside each WS handler instead.
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second, // reclaim idle connections
 	}
+
+	defer h.Shutdown()
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
