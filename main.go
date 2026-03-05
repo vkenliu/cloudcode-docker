@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,7 +31,7 @@ func main() {
 		noDocker        = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
 		corsOrigin      = flag.String("cors-origin", "", "Allowed CORS origin for dev (e.g. http://localhost:3000)")
 		accessToken     = flag.String("access-token", "", "Required bearer token / password for accessing the platform")
-		proxyCORSOrigin = flag.String("proxy-cors-origin", "", "CORS Access-Control-Allow-Origin injected into proxied instance responses (empty = disabled)")
+		proxyCORSOrigin = flag.String("proxy-cors-origin", "", "Comma-separated CORS origins injected into proxied instance responses, e.g. http://localhost:3000,http://localhost:4000 (empty = disabled)")
 	)
 	flag.Parse()
 
@@ -76,7 +77,14 @@ func main() {
 		log.Fatalf("Failed to sub embedded SPA: %v", err)
 	}
 
-	rp := proxy.New(*proxyCORSOrigin)
+	var proxyCORSOrigins []string
+	for _, o := range strings.Split(*proxyCORSOrigin, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			proxyCORSOrigins = append(proxyCORSOrigins, o)
+		}
+	}
+
+	rp := proxy.New(proxyCORSOrigins)
 	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, *corsOrigin)
 
 	mux := http.NewServeMux()

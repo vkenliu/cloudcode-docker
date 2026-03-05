@@ -22,19 +22,35 @@ type ReverseProxy struct {
 	proxies     map[string]*httputil.ReverseProxy // instanceID → proxy (strips /instance/{id} prefix)
 	direct      map[string]*httputil.ReverseProxy // instanceID → proxy (forwards path as-is)
 	ports       map[string]int                    // instanceID → port
-	corsOrigin  string                            // CORS origin to inject into proxied responses
+	corsOrigins []string                          // allowed CORS origins for proxied responses
 }
 
 // New creates a new ReverseProxy manager.
-// corsOrigin is the value for the Access-Control-Allow-Origin header injected into
-// proxied instance responses (e.g. "*" or "https://example.com"). Empty string disables injection.
-func New(corsOrigin string) *ReverseProxy {
+// corsOrigins is the list of origins for the Access-Control-Allow-Origin header injected
+// into proxied instance responses. The request Origin is matched against the list and
+// reflected back (required for multi-origin CORS with credentials). Empty = disabled.
+func New(corsOrigins []string) *ReverseProxy {
 	return &ReverseProxy{
-		proxies:    make(map[string]*httputil.ReverseProxy),
-		direct:     make(map[string]*httputil.ReverseProxy),
-		ports:      make(map[string]int),
-		corsOrigin: corsOrigin,
+		proxies:     make(map[string]*httputil.ReverseProxy),
+		direct:      make(map[string]*httputil.ReverseProxy),
+		ports:       make(map[string]int),
+		corsOrigins: corsOrigins,
 	}
+}
+
+// matchOrigin returns the origin from the allowlist that matches the request Origin header,
+// or "" if there is no match or the allowlist is empty.
+func (rp *ReverseProxy) matchOrigin(r *http.Request) string {
+	req := r.Header.Get("Origin")
+	if req == "" {
+		return ""
+	}
+	for _, o := range rp.corsOrigins {
+		if strings.EqualFold(o, req) {
+			return o
+		}
+	}
+	return ""
 }
 
 // Register adds or updates a proxy route for an instance.
@@ -59,7 +75,7 @@ func (rp *ReverseProxy) Register(instanceID string, port int) error {
 		req.Host = target.Host
 		req.Header.Del("Accept-Encoding")
 	}
-	stripProxy.ModifyResponse = chainModifyResponse(injectInstanceIsolation(instanceID), injectCORSHeaders(rp.corsOrigin))
+	stripProxy.ModifyResponse = chainModifyResponse(injectInstanceIsolation(instanceID), injectCORSHeaders(rp.corsOrigins))
 	stripProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadGateway)
@@ -75,7 +91,7 @@ func (rp *ReverseProxy) Register(instanceID string, port int) error {
 		req.Host = target.Host
 		req.Header.Del("Accept-Encoding")
 	}
-	directProxy.ModifyResponse = chainModifyResponse(injectInstanceIsolation(instanceID), injectCORSHeaders(rp.corsOrigin))
+	directProxy.ModifyResponse = chainModifyResponse(injectInstanceIsolation(instanceID), injectCORSHeaders(rp.corsOrigins))
 	directProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
@@ -101,9 +117,11 @@ func (rp *ReverseProxy) Unregister(instanceID string) {
 // ServeHTTP handles proxied requests, stripping /instance/{id} prefix.
 func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, instanceID string) {
 	// Handle CORS preflight before acquiring any locks.
-	if r.Method == http.MethodOptions && rp.corsOrigin != "" {
-		rp.writeCORSPreflight(w)
-		return
+	if r.Method == http.MethodOptions {
+		if origin := rp.matchOrigin(r); origin != "" {
+			rp.writeCORSPreflight(w, origin)
+			return
+		}
 	}
 
 	rp.mu.RLock()
@@ -123,9 +141,11 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request, instan
 // (e.g. /assets/index-xxx.js, /global/health, WebSocket upgrades).
 func (rp *ReverseProxy) ServeHTTPDirect(w http.ResponseWriter, r *http.Request, instanceID string) {
 	// Handle CORS preflight before acquiring any locks.
-	if r.Method == http.MethodOptions && rp.corsOrigin != "" {
-		rp.writeCORSPreflight(w)
-		return
+	if r.Method == http.MethodOptions {
+		if origin := rp.matchOrigin(r); origin != "" {
+			rp.writeCORSPreflight(w, origin)
+			return
+		}
 	}
 
 	rp.mu.RLock()
@@ -141,8 +161,8 @@ func (rp *ReverseProxy) ServeHTTPDirect(w http.ResponseWriter, r *http.Request, 
 }
 
 // writeCORSPreflight writes a 204 response for OPTIONS preflight requests.
-func (rp *ReverseProxy) writeCORSPreflight(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", rp.corsOrigin)
+func (rp *ReverseProxy) writeCORSPreflight(w http.ResponseWriter, origin string) {
+	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 	w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -175,15 +195,29 @@ func chainModifyResponse(hooks ...func(*http.Response) error) func(*http.Respons
 }
 
 // injectCORSHeaders returns a ModifyResponse hook that adds CORS headers to every
-// proxied response. This lets the opencode web UI be used cross-origin from the
-// platform's own frontend without modifying the container's opencode process.
-// If origin is empty, no headers are injected.
-func injectCORSHeaders(origin string) func(*http.Response) error {
-	if origin == "" {
+// proxied response. The request's Origin header is matched against the allowlist and
+// reflected back — required for multi-origin CORS with credentials.
+// Empty allowlist disables injection.
+func injectCORSHeaders(origins []string) func(*http.Response) error {
+	if len(origins) == 0 {
 		return nil
 	}
+	originSet := make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		originSet[strings.ToLower(o)] = struct{}{}
+	}
 	return func(resp *http.Response) error {
-		resp.Header.Set("Access-Control-Allow-Origin", origin)
+		if resp.Request == nil {
+			return nil
+		}
+		reqOrigin := resp.Request.Header.Get("Origin")
+		if reqOrigin == "" {
+			return nil
+		}
+		if _, ok := originSet[strings.ToLower(reqOrigin)]; !ok {
+			return nil
+		}
+		resp.Header.Set("Access-Control-Allow-Origin", reqOrigin)
 		resp.Header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
 		resp.Header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
 		resp.Header.Set("Access-Control-Allow-Credentials", "true")
