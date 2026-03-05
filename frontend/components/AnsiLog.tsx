@@ -1,13 +1,14 @@
 "use client";
 
-// #27/#28: AnsiLog renders log output safely without dangerouslySetInnerHTML.
-// Each component instance owns its AnsiToHtml converter (via useRef) so stream
-// state (split escape sequences) is never shared between multiple log panels.
-// Output is appended as text nodes and <span> elements via DOM APIs instead of
-// innerHTML, so no unsanitized HTML can be injected.
+// AnsiLog renders ANSI-escaped log output from a WebSocket stream.
+// ansi-to-html converts ANSI escape codes to <span style="color:..."> markup.
+// DOMPurify sanitizes the resulting HTML before it is written to the DOM,
+// preventing XSS from crafted ANSI sequences or library output.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import AnsiToHtml from "ansi-to-html";
+import DOMPurify from "dompurify";
+import { buildWsUrl } from "@/lib/api";
 
 interface Props {
   wsUrl: string;
@@ -16,6 +17,8 @@ interface Props {
 
 export default function AnsiLog({ wsUrl, className }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
+
   // Per-instance converter — stream:true keeps ANSI state across chunks (#28)
   const converterRef = useRef<AnsiToHtml | null>(null);
   if (!converterRef.current) {
@@ -28,7 +31,17 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     });
   }
 
+  // Resolve the authenticated WS URL (may fetch a one-time token) before connecting.
   useEffect(() => {
+    let cancelled = false;
+    buildWsUrl(wsUrl).then((url) => {
+      if (!cancelled) setResolvedUrl(url);
+    });
+    return () => { cancelled = true; };
+  }, [wsUrl]);
+
+  useEffect(() => {
+    if (!resolvedUrl) return;
     const container = containerRef.current;
     if (!container) return;
 
@@ -38,7 +51,8 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     placeholder.textContent = "Connecting…";
     container.appendChild(placeholder);
 
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(resolvedUrl);
+    ws.binaryType = "arraybuffer"; // ensure binary frames arrive as ArrayBuffer not Blob
 
     ws.onopen = () => {
       placeholder.remove();
@@ -50,10 +64,13 @@ export default function AnsiLog({ wsUrl, className }: Props) {
         ? new TextDecoder().decode(e.data)
         : (e.data as string);
 
-      // Convert ANSI → HTML string (escapeXML:true ensures entity escaping)
-      const html = converterRef.current!.toHtml(chunk);
+      // Convert ANSI → HTML string, then sanitize before injecting into DOM.
+      const raw = converterRef.current!.toHtml(chunk);
+      const html = DOMPurify.sanitize(raw, {
+        ALLOWED_TAGS: ["span"],
+        ALLOWED_ATTR: ["style"],
+      });
 
-      // Parse the converted HTML and append nodes safely (#27)
       const temp = document.createElement("div");
       temp.innerHTML = html;
       while (temp.firstChild) {
@@ -80,8 +97,17 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     return () => {
       ws.close();
       if (container) container.innerHTML = "";
+      // Reset the ANSI converter so stale escape-sequence state doesn't bleed
+      // into the next connection.
+      converterRef.current = new AnsiToHtml({
+        fg: "#a3e635",
+        bg: "#020617",
+        newline: false,
+        escapeXML: true,
+        stream: true,
+      });
     };
-  }, [wsUrl]);
+  }, [resolvedUrl]);
 
   return (
     <div

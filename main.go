@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"embed"
 	"flag"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,19 +20,23 @@ import (
 	"github.com/naiba/cloudcode/internal/store"
 )
 
-var version = "dev"
+//go:embed frontend/dist
+var embeddedSPA embed.FS
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":8080", "HTTP listen address")
-		dataDir  = flag.String("data", "./data", "Data directory for SQLite database")
-		imgName  = flag.String("image", "ghcr.io/naiba/cloudcode-base:latest", "Docker image name for opencode instances")
-		noDocker = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
-		corsOrigin = flag.String("cors-origin", "", "Allowed CORS origin for dev (e.g. http://localhost:3000)")
+		addr        = flag.String("addr", ":8080", "HTTP listen address")
+		dataDir     = flag.String("data", "./data", "Data directory for SQLite database")
+		imgName     = flag.String("image", "ghcr.io/naiba/cloudcode-base:latest", "Docker image name for opencode instances")
+		noDocker    = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
+		corsOrigin  = flag.String("cors-origin", "", "Comma-separated CORS origins for the platform API, e.g. http://localhost:3000,http://localhost:4000")
+		accessToken = flag.String("access-token", "", "Required bearer token / password for accessing the platform")
 	)
 	flag.Parse()
 
-	_ = version
+	if *accessToken == "" {
+		log.Fatal("--access-token is required. Set a strong secret token to protect the platform.")
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting CloudCode Management Platform...")
@@ -64,16 +71,23 @@ func main() {
 		log.Println("Docker disabled (--no-docker), container operations will fail")
 	}
 
+	spaFiles, err := fs.Sub(embeddedSPA, "frontend/dist")
+	if err != nil {
+		log.Fatalf("Failed to sub embedded SPA: %v", err)
+	}
+
+	corsOrigins := parseOrigins(*corsOrigin)
+
 	rp := proxy.New()
-	h := handler.New(db, dm, rp, cfgMgr)
+	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, corsOrigins)
 
 	mux := http.NewServeMux()
 
 	// CORS middleware for development
 	var rootHandler http.Handler = mux
-	if *corsOrigin != "" {
-		log.Printf("CORS enabled for origin: %s", *corsOrigin)
-		rootHandler = corsMiddleware(*corsOrigin, mux)
+	if len(corsOrigins) > 0 {
+		log.Printf("CORS enabled for origins: %s", strings.Join(corsOrigins, ", "))
+		rootHandler = corsMiddleware(corsOrigins, mux)
 	}
 
 	h.RegisterRoutes(mux)
@@ -81,8 +95,10 @@ func main() {
 	server := &http.Server{
 		Addr:              *addr,
 		Handler:           rootHandler,
-		ReadHeaderTimeout: 10 * time.Second, // #22: prevent Slowloris attacks
-		IdleTimeout:       120 * time.Second, // #22: reclaim idle connections
+		ReadHeaderTimeout: 10 * time.Second,  // prevent Slowloris header attacks
+		ReadTimeout:       30 * time.Second,  // limit slow-body attacks
+		WriteTimeout:      120 * time.Second, // generous for streaming (logs/terminal WS handshake)
+		IdleTimeout:       120 * time.Second, // reclaim idle connections
 	}
 
 	go func() {
@@ -104,11 +120,35 @@ func main() {
 	}
 }
 
-func corsMiddleware(origin string, next http.Handler) http.Handler {
+// parseOrigins splits a comma-separated origin string into a deduplicated slice.
+func parseOrigins(s string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, o := range strings.Split(s, ",") {
+		if o = strings.TrimSpace(o); o != "" && !seen[o] {
+			seen[o] = true
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// corsMiddleware reflects the request Origin back if it is in the allowlist.
+func corsMiddleware(origins []string, next http.Handler) http.Handler {
+	set := make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		set[strings.ToLower(o)] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if _, ok := set[strings.ToLower(origin)]; ok {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

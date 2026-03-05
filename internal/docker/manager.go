@@ -9,9 +9,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/moby/moby/api/pkg/stdcopy"
 	"net/netip"
 
-	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
@@ -29,6 +29,8 @@ const (
 	networkName     = "cloudcode-net"
 	containerPrefix = "cloudcode-"
 	volumePrefix    = "cloudcode-home-"
+	// containerPort is the fixed internal port opencode listens on inside the container.
+	containerPort = 4096
 )
 
 type Manager struct {
@@ -75,15 +77,22 @@ func (m *Manager) ensureNetwork(ctx context.Context) error {
 }
 
 func (m *Manager) ensureImage(ctx context.Context) error {
-	log.Printf("Pulling latest image %s...", m.image)
-	reader, err := m.cli.ImagePull(ctx, m.image, client.ImagePullOptions{})
+	// If the image already exists locally, skip the pull entirely.
+	exists, err := m.ImageExists(ctx)
 	if err != nil {
-		// If pull fails but a local image already exists, continue with it.
-		exists, checkErr := m.ImageExists(ctx)
-		if checkErr == nil && exists {
-			log.Printf("Pull failed (%v), using existing local image %s", err, m.image)
-			return nil
-		}
+		log.Printf("Warning: could not check for image %s: %v", m.image, err)
+	}
+	if exists {
+		log.Printf("Image %s found locally, skipping pull", m.image)
+		return nil
+	}
+
+	log.Printf("Image %s not found locally, pulling...", m.image)
+	// Use a background context so the pull is not canceled if the HTTP request
+	// context times out or the client disconnects mid-pull.
+	pullCtx := context.Background()
+	reader, err := m.cli.ImagePull(pullCtx, m.image, client.ImagePullOptions{})
+	if err != nil {
 		return fmt.Errorf("pull image %s: %w", m.image, err)
 	}
 	defer reader.Close()
@@ -92,6 +101,10 @@ func (m *Manager) ensureImage(ctx context.Context) error {
 	return nil
 }
 
+// CreateContainer creates and starts a new container for the given instance.
+// Container ports are NOT published to the host — traffic is routed through
+// the CloudCode reverse proxy via the cloudcode-net Docker network.
+// Returns the container ID.
 func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (string, error) {
 	// #16: pull/check image before acquiring the global mutex to avoid blocking
 	// other operations (status checks, etc.) during a potentially long image pull.
@@ -105,8 +118,15 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 	containerName := containerPrefix + inst.ID
 
 	env := []string{
-		fmt.Sprintf("OPENCODE_PORT=%d", inst.Port),
+		fmt.Sprintf("OPENCODE_PORT=%d", containerPort),
 		fmt.Sprintf("CC_INSTANCE_NAME=%s", inst.Name),
+	}
+
+	// Set OpenCode's native Basic Auth password to the per-instance access token.
+	// This enforces auth at the OpenCode level as a second layer of defence,
+	// in addition to the CloudCode proxy token check.
+	if inst.AccessToken != "" {
+		env = append(env, fmt.Sprintf("OPENCODE_SERVER_PASSWORD=%s", inst.AccessToken))
 	}
 
 	if m.config != nil {
@@ -143,11 +163,7 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 		}
 	}
 
-	containerPort, err := network.ParsePort(fmt.Sprintf("%d/tcp", inst.Port))
-	if err != nil {
-		return "", fmt.Errorf("parse container port: %w", err)
-	}
-	hostIP := netip.MustParseAddr("127.0.0.1")
+	exposedPort := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
 	resp, err := m.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: containerName,
 		Config: &container.Config{
@@ -158,8 +174,9 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				labelManaged: "true",
 				labelInstID:  inst.ID,
 			},
+			// ExposedPorts is required for Docker to honour PortBindings.
 			ExposedPorts: network.PortSet{
-				containerPort: struct{}{},
+				exposedPort: struct{}{},
 			},
 		},
 		HostConfig: &container.HostConfig{
@@ -168,9 +185,14 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				Name: "unless-stopped",
 			},
 			Resources: inst.ContainerResources(),
+			// Publish the container port to a random host port (Docker picks it).
+			// Binding to 127.0.0.1 keeps it inaccessible from the network.
+			// The proxy reads the assigned host port via GetContainerIPAndPort and
+			// routes through 127.0.0.1:<hostPort>, which is reliable regardless of
+			// what address opencode binds to inside the container.
 			PortBindings: network.PortMap{
-				containerPort: []network.PortBinding{
-					{HostIP: hostIP, HostPort: fmt.Sprintf("%d", inst.Port)},
+				exposedPort: []network.PortBinding{
+					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "0"},
 				},
 			},
 		},
@@ -190,6 +212,71 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 	}
 
 	return resp.ID, nil
+}
+
+// GetContainerIPAndPort returns the host/IP and port to use for proxying to the container.
+//
+// For legacy containers (created before port-pool removal) that publish a host port,
+// it returns "127.0.0.1" and the published host port — because old opencode versions
+// bind to 127.0.0.1 inside the container and are only reachable via the published port.
+//
+// For new containers (no published ports), it returns the container's IP on
+// cloudcode-net and OPENCODE_PORT from the container env (default 4096).
+func (m *Manager) GetContainerIPAndPort(ctx context.Context, containerID string) (string, int, error) {
+	result, err := m.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", 0, fmt.Errorf("inspect container: %w", err)
+	}
+
+	// Legacy containers: if any host port binding exists, use 127.0.0.1 + host port.
+	// Old opencode binds to 127.0.0.1 inside the container; the Docker bridge IP
+	// is unreachable for those processes.
+	for _, bindings := range result.Container.NetworkSettings.Ports {
+		for _, b := range bindings {
+			if b.HostPort != "" {
+				var hp int
+				if n, _ := fmt.Sscanf(b.HostPort, "%d", &hp); n == 1 && hp > 0 {
+					return "127.0.0.1", hp, nil
+				}
+			}
+		}
+	}
+
+	// New containers: connect via Docker network IP + OPENCODE_PORT.
+	ip := ""
+	if ep, ok := result.Container.NetworkSettings.Networks[networkName]; ok && ep.IPAddress.IsValid() {
+		ip = ep.IPAddress.String()
+	}
+	if ip == "" {
+		return "", 0, fmt.Errorf("container %s has no IP on network %s", containerID, networkName)
+	}
+
+	// Read OPENCODE_PORT from container env.
+	port := containerPort
+	for _, env := range result.Container.Config.Env {
+		if strings.HasPrefix(env, "OPENCODE_PORT=") {
+			var p int
+			if n, _ := fmt.Sscanf(env[len("OPENCODE_PORT="):], "%d", &p); n == 1 && p > 0 {
+				port = p
+			}
+			break
+		}
+	}
+
+	return ip, port, nil
+}
+
+// GetContainerIP returns the container's IP address on the cloudcode-net network.
+// Called after CreateContainer / StartContainer to get the proxy target address.
+// Use GetContainerIPAndPort when the port may differ (e.g. legacy containers).
+func (m *Manager) GetContainerIP(ctx context.Context, containerID string) (string, error) {
+	ip, _, err := m.GetContainerIPAndPort(ctx, containerID)
+	return ip, err
+}
+
+// ContainerPort returns the fixed internal port opencode listens on for new containers.
+func ContainerPort() int {
+	return containerPort
 }
 
 func (m *Manager) StopContainer(ctx context.Context, containerID string) error {

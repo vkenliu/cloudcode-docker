@@ -7,6 +7,7 @@ A self-hosted management platform for [OpenCode](https://opencode.ai) instances.
 
 ## Features
 
+- **Token-based access control** — Single admin token gates all API, WebSocket, and proxy routes; session cookie issued on login
 - **Multi-instance management** — Create, start, stop, restart, and delete OpenCode instances
 - **Configurable resource limits** — Set memory and CPU limits per instance at creation time, or leave unlimited
 - **Session isolation** — Each instance has its own workspace; auth tokens are shared globally
@@ -29,32 +30,68 @@ curl -O https://raw.githubusercontent.com/naiba/cloudcode/main/docker-compose.ym
 docker compose up -d
 ```
 
-Open http://localhost:8080 in your browser.
+Open http://localhost:8080 in your browser and log in with the token configured via `--access-token`.
 
 Images are pulled from `ghcr.io/naiba/cloudcode` and `ghcr.io/naiba/cloudcode-base` automatically.
+
+## Authentication
+
+All API, WebSocket, and proxy routes require authentication. The platform uses a single admin token set at startup.
+
+### Login
+
+`POST /api/auth/login` with `{"token": "<your-token>"}`. On success a session cookie (`_cc_session`) is set — HttpOnly, SameSite=Lax, 30-day MaxAge.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--access-token` | *(required)* | Admin token. Server refuses to start without it. |
+| `--cors-origin` | `""` | Allowed CORS origins for the platform API (dev only). Comma-separated. |
+
+### Rate limiting
+
+Login attempts are limited to **10 per IP per 60 seconds**. Exceeded attempts return `429 Too Many Requests`.
+
+### WebSocket authentication
+
+Browsers cannot send cookies on cross-origin WebSocket upgrades. For dev setups where the frontend runs on a different origin, fetch a one-time token first:
+
+```js
+// 1. Fetch a one-time token (session cookie sent automatically)
+const { token } = await fetch('/api/auth/ws-token').then(r => r.json())
+// 2. Append it to the WebSocket URL
+const ws = new WebSocket(`ws://localhost:8080/instances/${id}/logs/ws?token=${token}`)
+```
+
+The `buildWsUrl(path)` helper in `frontend/lib/api.ts` handles this automatically.
 
 ## Architecture
 
 ```
 Browser → CloudCode Platform (Go JSON API + Next.js frontend)
+               ├── /login           — Login page (public)
                ├── Dashboard        — List / manage instances
                ├── Settings         — Global config editor
-               └── /instance/{id}/  — Reverse proxy → container:port
-                                          │
+               └── /instance/{id}/  — Reverse proxy (token-validated)
+                                          │  cloudcode-net (Docker bridge)
                               ┌────────────┼────────────┐
                               ▼            ▼            ▼
                          Container 1  Container 2  Container N
                          (opencode    (opencode    (opencode
-                          web :10000)  web :10001)  web :10002)
+                          web :4096)   web :4096)   web :4096)
+                         [Basic Auth] [Basic Auth] [Basic Auth]
 ```
 
+Container ports are **not published to the host**. All traffic routes through the Go proxy via the internal `cloudcode-net` Docker bridge network. Each container runs OpenCode with `OPENCODE_SERVER_PASSWORD` set to its unique access token, providing defense-in-depth.
+
 ```
-main.go                          Entry point, starts HTTP server
+main.go                          Entry point, starts HTTP server, embeds frontend/dist
 internal/
   config/config.go               Config file management (read/write host config, generate bind mounts)
   config/plugins/                Embedded built-in plugins (written to plugins/ on startup)
   docker/manager.go              Docker container lifecycle (create/start/stop/delete)
-  handler/handler.go             All HTTP handlers (JSON REST API)
+  handler/handler.go             All HTTP handlers (JSON REST API, auth, session management)
   handler/memory_*.go            Platform-specific host memory detection
   proxy/proxy.go                 Dynamic reverse proxy to each instance's OpenCode web UI
   store/store.go                 SQLite persistence (instance CRUD)
@@ -63,9 +100,11 @@ docker/
   entrypoint.sh                  Container startup script (updates deps + starts opencode web)
 Dockerfile.platform              Multi-stage build for the platform itself
 frontend/                        Next.js 16 App Router frontend (TypeScript + Tailwind)
-  app/                           Pages: dashboard, instance detail, terminal, settings, new instance
-  components/AnsiLog.tsx         ANSI log renderer (safe DOM API, no dangerouslySetInnerHTML)
-  lib/api.ts                     Typed API client + WebSocket helpers
+  app/                           Pages: dashboard, instance detail, terminal, settings, new, login
+  components/AnsiLog.tsx         ANSI log renderer (DOMPurify sanitized)
+  components/NavBar.tsx          Top navigation with logout button
+  lib/api.ts                     Typed API client + WebSocket helpers (buildWsUrl, auth)
+  lib/utils.ts                   Shared UI utilities (statusColor, statusLabel)
 ```
 
 Each container runs `opencode web` and is accessible through the platform's reverse proxy.
@@ -100,30 +139,42 @@ For persistent tunnels with custom domains, see the [Cloudflare Tunnel documenta
 ## Tech Stack
 
 - **Backend**: Go 1.25, `net/http` stdlib router, SQLite (via `modernc.org/sqlite`, pure Go no CGO)
-- **Frontend**: Next.js 16 App Router, TypeScript, Tailwind CSS v4, xterm.js for terminal
+- **Frontend**: Next.js 16 App Router, TypeScript, Tailwind CSS v4, xterm.js for terminal, DOMPurify for log sanitization
 - **Containers**: Docker SDK (`github.com/moby/moby/client`)
 - **Base Image**: Ubuntu 24.04 + Go + Node 22 + Bun + OpenCode + Oh My OpenCode
 
 ## Development
 
 ```bash
+# Build the frontend first (required — binary embeds frontend/dist via go:embed)
+cd frontend && bun install && bun run build && cd ..
+
 # Build the Go binary
 go build -o bin/cloudcode .
 
-# Run backend in dev mode (no Docker required)
-go run . --no-docker --addr :9090
+# Run backend (access token is required)
+./bin/cloudcode --addr :8080 --access-token dev-token-changeme
+
+# Run backend with CORS for a separate frontend dev server
+./bin/cloudcode --addr :8080 --access-token dev-token-changeme --cors-origin http://localhost:3000
 
 # Run frontend dev server (in frontend/)
-bun install
+# Set env vars so requests go directly to Go (not through Next.js proxy)
+NEXT_PUBLIC_API_BASE=http://localhost:8080 \
+NEXT_PUBLIC_WS_BASE=ws://localhost:8080 \
+NEXT_PUBLIC_BACKEND_URL=http://localhost:8080 \
 bun run dev
 
-# Backend started with CORS for frontend dev:
-./bin/cloudcode --addr :9090 --cors-origin http://localhost:3000
+# Or set them permanently in frontend/.env.local:
+# NEXT_PUBLIC_API_BASE=http://localhost:8080
+# NEXT_PUBLIC_WS_BASE=ws://localhost:8080
+# NEXT_PUBLIC_BACKEND_URL=http://localhost:8080
 
-# Static analysis
+# Run backend in no-docker mode (UI preview only, no containers)
+go run . --no-docker --addr :8080 --access-token dev-token-changeme
+
+# Static analysis and build checks
 go vet ./...
-
-# Build checks
 go build ./...
 bun run build   # in frontend/
 
@@ -134,14 +185,18 @@ docker build -t cloudcode-base:latest -f docker/Dockerfile docker/
 docker build -t cloudcode:latest -f Dockerfile.platform .
 ```
 
-## Port Allocation
+> **Important:** `go build` embeds `frontend/dist/` at compile time via `//go:embed`. Always run `bun run build` in `frontend/` before `go build` when frontend changes are made.
 
-The platform assigns one port per instance from the range `10000–10100` (101 ports max). Ports are tracked in SQLite and released when an instance is deleted.
+## Security
 
-## Security Notes
-
-- Path traversal protection on all config file operations (`containedPath` validation)
-- WebSocket connections validated against `Host` header (CSRF protection)
-- Request bodies limited to 1–10 MB via `http.MaxBytesReader`
-- `_cc_inst` cookie uses `HttpOnly` + `Secure` (when served over TLS) + `SameSite=Lax`
-- Instance IDs in injected proxy scripts are JSON-encoded to prevent XSS
+- **Platform token auth** — All routes protected by session cookie; login rate-limited to 10 attempts / IP / 60s
+- **Per-instance access tokens** — Each instance has a unique 32-byte hex token. Required to access the web UI (`?token=` or `_cc_inst_token_{id}` cookie) and for SDK/CLI access (`Authorization: Bearer` or `--password`). Tokens are enforced at two layers: the CloudCode proxy and OpenCode's native `OPENCODE_SERVER_PASSWORD` Basic Auth inside the container.
+- **No host port exposure** — Container ports are not published to the host. Traffic routes exclusively through the CloudCode proxy via `cloudcode-net`.
+- **Session management** — Existing session invalidated on re-login; sessions stored in memory (cleared on restart)
+- **WS tokens** — One-time tokens for cross-origin WebSocket auth; 60s TTL, pruned by background goroutine
+- **Path traversal protection** — All config file operations validated by `containedPath`; `dirName` restricted to an allowlist
+- **No secret leakage** — `env_vars` excluded from all instance API responses; `auth.json` content excluded from the default settings response (load-on-demand via `GET /api/settings/file`)
+- **XSS prevention** — Log output sanitized with DOMPurify before DOM insertion
+- **Request limits** — Bodies limited to 1–10 MB via `http.MaxBytesReader`; logs WebSocket read limit 512 bytes
+- **Security headers** — SPA responses include `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, and `Content-Security-Policy`
+- **TLS** — `_cc_session` and `_cc_inst` cookies set `Secure` flag when served over HTTPS

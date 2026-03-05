@@ -6,7 +6,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { wsBase } from "@/lib/api";
+import { buildWsUrl } from "@/lib/api";
 
 export default function TerminalPage() {
   const { id } = useParams<{ id: string }>();
@@ -46,13 +46,18 @@ export default function TerminalPage() {
       fitAddon.fit();
       termRef.current = term;
 
-      // Connect WebSocket
-      const ws = new WebSocket(`${wsBase()}/instances/${id}/terminal/ws`);
+      // Connect WebSocket (buildWsUrl fetches a one-time auth token for cross-origin WS)
+      const ws = new WebSocket(await buildWsUrl(`/instances/${id}/terminal/ws`));
+      // Assign to ref immediately so the outer cleanup function can close it
+      // even if unmount races with this async init completing.
       wsRef.current = ws;
       ws.binaryType = "arraybuffer";
 
+      // If unmount already ran, close the socket we just opened and bail out.
+      if (aborted) { ws.close(); return; }
+
       ws.onopen = () => {
-        if (aborted) { ws.close(); return; } // #29
+        if (aborted) { ws.close(); return; }
         ws.send(
           JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows })
         );

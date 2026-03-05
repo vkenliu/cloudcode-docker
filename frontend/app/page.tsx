@@ -1,33 +1,10 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
-import { api, wsBase, instanceProxyUrl, Instance, InstanceStatus } from "@/lib/api";
+import { api, instanceOpenUrl, Instance } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
-
-// ---- helpers ---------------------------------------------------------------
-
-function statusColor(s: InstanceStatus): string {
-  switch (s) {
-    case "running":
-      return "bg-green-500";
-    case "stopped":
-    case "created":
-      return "bg-yellow-500";
-    case "exited":
-      return "bg-slate-500";
-    case "error":
-      return "bg-red-500";
-    case "removed":
-      return "bg-slate-600";
-    default:
-      return "bg-slate-500";
-  }
-}
-
-function statusLabel(s: InstanceStatus): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
+import { statusColor, statusLabel } from "@/lib/utils";
 
 // ---- Log modal -------------------------------------------------------------
 
@@ -56,7 +33,7 @@ function LogModal({
           </button>
         </div>
         <AnsiLog
-          wsUrl={`${wsBase()}/instances/${instanceId}/logs/ws`}
+          wsUrl={`/instances/${instanceId}/logs/ws`}
           className="flex-1 min-h-0"
         />
       </div>
@@ -78,32 +55,6 @@ function InstanceCard({
   const [busy, setBusy] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [error, setError] = useState("");
-
-  // Status polling every 10s
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const result = await api.instances.pollStatus(
-          instance.id,
-          instance.status
-        );
-        if (result === null) {
-          // unchanged — schedule next
-        } else if ("deleted" in result) {
-          onDeleted(instance.id);
-          return;
-        } else {
-          onUpdated(result);
-        }
-      } catch {
-        // ignore poll errors silently
-      }
-      timer = setTimeout(poll, 10000);
-    };
-    timer = setTimeout(poll, 10000);
-    return () => clearTimeout(timer);
-  }, [instance.id, instance.status, onDeleted, onUpdated]);
 
   const doAction = async (action: "start" | "stop" | "restart") => {
     setBusy(true);
@@ -162,13 +113,12 @@ function InstanceCard({
               </Link>
             </div>
             <div className="text-xs text-slate-400 mt-0.5 ml-[18px]">
-              {statusLabel(instance.status)} · port {instance.port} · ID{" "}
-              {instance.id}
+              {statusLabel(instance.status)} · ID {instance.id}
             </div>
           </div>
-          {isRunning && (
+          {isRunning && instance.access_token && (
             <a
-              href={instanceProxyUrl(instance.id)}
+              href={instanceOpenUrl(instance.id, instance.access_token)}
               target="_blank"
               rel="noopener noreferrer"
               className="shrink-0 px-3 py-1 text-xs bg-blue-600 hover:bg-blue-500 rounded text-white font-medium transition-colors"
@@ -234,12 +184,18 @@ function InstanceCard({
           >
             Logs
           </button>
-          <Link
-            href={`/instances/${instance.id}/terminal`}
-            className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-slate-200"
-          >
-            Terminal
-          </Link>
+          {isRunning ? (
+            <Link
+              href={`/instances/${instance.id}/terminal`}
+              className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-slate-200"
+            >
+              Terminal
+            </Link>
+          ) : (
+            <span className="px-3 py-1 text-xs bg-slate-700 rounded text-slate-500 cursor-not-allowed">
+              Terminal
+            </span>
+          )}
           <button
             disabled={busy}
             onClick={doDelete}
@@ -275,6 +231,47 @@ export default function DashboardPage() {
   useEffect(() => {
     loadInstances();
   }, [loadInstances]);
+
+  // Single batch poller for all instances — one request every 10 s instead of
+  // one per card. instancesRef keeps a stable reference so the poll closure
+  // always sees current state without being added to the effect deps.
+  const instancesRef = useRef<Instance[]>([]);
+  useEffect(() => {
+    instancesRef.current = instances;
+  }, [instances]);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      const current = instancesRef.current;
+      if (current.length === 0) {
+        timer = setTimeout(poll, 10000);
+        return;
+      }
+      const statuses: Record<string, string> = {};
+      for (const inst of current) statuses[inst.id] = inst.status;
+
+      try {
+        const changed = await api.instances.pollAllStatus(statuses);
+        setInstances((prev) => {
+          let next = prev;
+          for (const [id, updated] of Object.entries(changed)) {
+            if (updated === null) {
+              next = next.filter((i) => i.id !== id);
+            } else {
+              next = next.map((i) => (i.id === id ? updated : i));
+            }
+          }
+          return next;
+        });
+      } catch {
+        // ignore transient poll errors
+      }
+      timer = setTimeout(poll, 10000);
+    };
+    timer = setTimeout(poll, 10000);
+    return () => clearTimeout(timer);
+  }, []);
 
   const handleDeleted = useCallback((id: string) => {
     setInstances((prev) => prev.filter((i) => i.id !== id));
