@@ -75,22 +75,57 @@ export interface ApiError {
 
 const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
-// WebSocket base derived from API base (http→ws, https→wss).
-// Falls back to window.location.host when no explicit base is set (same-origin).
-// Direct URL to Go's reverse-proxy route for a given instance.
-// Must use the Go backend host directly (not Next.js) to preserve trailing slash.
+// Direct URL to the Go backend for the instance proxy.
+// The instance proxy requires the session cookie to reach Go directly —
+// Next.js dev-server rewrites strip cookies, so we bypass the proxy entirely.
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? BASE;
+
 export function instanceProxyUrl(id: string): string {
-  return `${BASE || ""}/instance/${id}/`;
+  return `${BACKEND_URL}/instance/${id}/`;
 }
 
 export function wsBase(): string {
-  if (BASE) {
-    return BASE.replace(/^http/, "ws");
-  }
+  // Explicit WS base takes priority (set in dev when Next.js can't proxy WS upgrades).
+  const wsEnv = process.env.NEXT_PUBLIC_WS_BASE;
+  if (wsEnv) return wsEnv;
+  // If an HTTP API base is configured, derive the WS base from it.
+  if (BASE) return BASE.replace(/^http/, "ws");
+  // Same-origin: derive from current page URL at runtime.
   if (typeof window !== "undefined") {
     return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
   }
-  return "ws://localhost:9090";
+  return "ws://localhost:8080";
+}
+
+/**
+ * Build an authenticated WebSocket URL.
+ * When the WS base is cross-origin (dev mode), the browser won't send cookies
+ * with the upgrade request. This fetches a one-time token from the backend
+ * (via the same-origin proxy, so the session cookie is sent) and appends it
+ * as ?token= so the Go server can authenticate the WS handshake.
+ */
+export async function buildWsUrl(path: string): Promise<string> {
+  const base = wsBase();
+  const url = `${base}${path}`;
+
+  // Only need a token when WS goes to a different origin than the page.
+  if (typeof window === "undefined") return url;
+  try {
+    const pageOrigin = window.location.origin; // e.g. http://localhost:4000
+    const wsOrigin = new URL(url).origin.replace(/^ws/, "http"); // e.g. http://localhost:8080
+    if (wsOrigin === pageOrigin) return url; // same-origin: cookie sent automatically
+  } catch {
+    return url;
+  }
+
+  // Cross-origin: fetch a one-time token via the session-authenticated proxy.
+  try {
+    const { token } = await api.auth.wsToken();
+    return `${url}?token=${encodeURIComponent(token)}`;
+  } catch {
+    // Fall back to the plain URL; the server will return 401 if auth fails.
+    return url;
+  }
 }
 
 class ApiResponseError extends Error {
@@ -111,11 +146,18 @@ async function request<T>(
 ): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
+    credentials: "include", // always send session cookie
     headers: body ? { "Content-Type": "application/json" } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
 
   if (res.status === 204) {
+    return undefined as T;
+  }
+
+  // Global 401 handler: redirect to /login for browser sessions.
+  if (res.status === 401 && typeof window !== "undefined") {
+    window.location.href = "/login";
     return undefined as T;
   }
 
@@ -140,6 +182,24 @@ async function request<T>(
 // ============================================================
 
 export const api = {
+  // ============================================================
+  // Auth
+  // ============================================================
+  auth: {
+    login(token: string): Promise<{ status: string }> {
+      return request("POST", "/api/auth/login", { token });
+    },
+
+    logout(): Promise<{ status: string }> {
+      return request("POST", "/api/auth/logout");
+    },
+
+    /** Returns a single-use token for authenticating cross-origin WebSocket connections. */
+    wsToken(): Promise<{ token: string }> {
+      return request("GET", "/api/auth/ws-token");
+    },
+  },
+
   instances: {
     list(): Promise<Instance[]> {
       return request("GET", "/api/instances");
@@ -179,7 +239,8 @@ export const api = {
       currentStatus: string
     ): Promise<Instance | { deleted: true } | null> {
       const res = await fetch(
-        `${BASE}/api/instances/${id}/status?s=${encodeURIComponent(currentStatus)}`
+        `${BASE}/api/instances/${id}/status?s=${encodeURIComponent(currentStatus)}`,
+        { credentials: "include" }
       );
       if (res.status === 204) return null;
       const text = await res.text();
@@ -196,6 +257,22 @@ export const api = {
         throw new ApiResponseError(res.status, { error: errMsg });
       }
       return JSON.parse(text) as Instance;
+    },
+
+    /**
+     * Batch poll: send all known {id → currentStatus} in one request.
+     * Returns a map of changed entries: Instance for updates, null for deleted.
+     * IDs whose status has not changed are absent from the result.
+     */
+    async pollAllStatus(
+      statuses: Record<string, string>
+    ): Promise<Record<string, Instance | null>> {
+      const data = await request<{ changed: Record<string, Instance | null> }>(
+        "POST",
+        "/api/instances/status",
+        { ids: statuses }
+      );
+      return data.changed;
     },
   },
 

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { api, wsBase, instanceProxyUrl, Instance, InstanceStatus } from "@/lib/api";
+import { api, instanceProxyUrl, Instance, InstanceStatus } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
 
 function statusColor(s: InstanceStatus): string {
@@ -42,7 +42,7 @@ function Field({ label, value }: { label: string; value: string }) {
 function LogPanel({ instanceId }: { instanceId: string }) {
   return (
     <AnsiLog
-      wsUrl={`${wsBase()}/instances/${instanceId}/logs/ws`}
+      wsUrl={`/instances/${instanceId}/logs/ws`}
       className="h-64"
     />
   );

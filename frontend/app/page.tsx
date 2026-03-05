@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { api, wsBase, instanceProxyUrl, Instance, InstanceStatus } from "@/lib/api";
+import { api, instanceProxyUrl, Instance, InstanceStatus } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
 
 // ---- helpers ---------------------------------------------------------------
@@ -56,7 +56,7 @@ function LogModal({
           </button>
         </div>
         <AnsiLog
-          wsUrl={`${wsBase()}/instances/${instanceId}/logs/ws`}
+          wsUrl={`/instances/${instanceId}/logs/ws`}
           className="flex-1 min-h-0"
         />
       </div>
@@ -78,32 +78,6 @@ function InstanceCard({
   const [busy, setBusy] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [error, setError] = useState("");
-
-  // Status polling every 10s
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const result = await api.instances.pollStatus(
-          instance.id,
-          instance.status
-        );
-        if (result === null) {
-          // unchanged — schedule next
-        } else if ("deleted" in result) {
-          onDeleted(instance.id);
-          return;
-        } else {
-          onUpdated(result);
-        }
-      } catch {
-        // ignore poll errors silently
-      }
-      timer = setTimeout(poll, 10000);
-    };
-    timer = setTimeout(poll, 10000);
-    return () => clearTimeout(timer);
-  }, [instance.id, instance.status, onDeleted, onUpdated]);
 
   const doAction = async (action: "start" | "stop" | "restart") => {
     setBusy(true);
@@ -275,6 +249,46 @@ export default function DashboardPage() {
   useEffect(() => {
     loadInstances();
   }, [loadInstances]);
+
+  // Single batch poller for all instances — one request every 10 s instead of
+  // one per card.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      setInstances((prev) => {
+        if (prev.length === 0) return prev;
+        const statuses: Record<string, string> = {};
+        for (const inst of prev) statuses[inst.id] = inst.status;
+
+        api.instances
+          .pollAllStatus(statuses)
+          .then((changed) => {
+            setInstances((current) => {
+              let next = current;
+              for (const [id, updated] of Object.entries(changed)) {
+                if (updated === null) {
+                  // Instance deleted
+                  next = next.filter((i) => i.id !== id);
+                } else {
+                  next = next.map((i) => (i.id === id ? updated : i));
+                }
+              }
+              return next;
+            });
+          })
+          .catch(() => {
+            // ignore transient poll errors
+          })
+          .finally(() => {
+            timer = setTimeout(poll, 10000);
+          });
+
+        return prev; // return synchronously unchanged; async update above
+      });
+    };
+    timer = setTimeout(poll, 10000);
+    return () => clearTimeout(timer);
+  }, []);
 
   const handleDeleted = useCallback((id: string) => {
     setInstances((prev) => prev.filter((i) => i.id !== id));

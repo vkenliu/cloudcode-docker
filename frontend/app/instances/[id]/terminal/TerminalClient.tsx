@@ -6,7 +6,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { wsBase } from "@/lib/api";
+import { buildWsUrl } from "@/lib/api";
 
 export default function TerminalPage() {
   const { id } = useParams<{ id: string }>();
@@ -46,8 +46,8 @@ export default function TerminalPage() {
       fitAddon.fit();
       termRef.current = term;
 
-      // Connect WebSocket
-      const ws = new WebSocket(`${wsBase()}/instances/${id}/terminal/ws`);
+      // Connect WebSocket (buildWsUrl fetches a one-time auth token for cross-origin WS)
+      const ws = new WebSocket(await buildWsUrl(`/instances/${id}/terminal/ws`));
       wsRef.current = ws;
       ws.binaryType = "arraybuffer";
 

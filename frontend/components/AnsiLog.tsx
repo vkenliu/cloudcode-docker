@@ -6,8 +6,9 @@
 // Output is appended as text nodes and <span> elements via DOM APIs instead of
 // innerHTML, so no unsanitized HTML can be injected.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import AnsiToHtml from "ansi-to-html";
+import { buildWsUrl } from "@/lib/api";
 
 interface Props {
   wsUrl: string;
@@ -16,6 +17,8 @@ interface Props {
 
 export default function AnsiLog({ wsUrl, className }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [resolvedUrl, setResolvedUrl] = useState<string | null>(null);
+
   // Per-instance converter — stream:true keeps ANSI state across chunks (#28)
   const converterRef = useRef<AnsiToHtml | null>(null);
   if (!converterRef.current) {
@@ -28,7 +31,17 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     });
   }
 
+  // Resolve the authenticated WS URL (may fetch a one-time token) before connecting.
   useEffect(() => {
+    let cancelled = false;
+    buildWsUrl(wsUrl).then((url) => {
+      if (!cancelled) setResolvedUrl(url);
+    });
+    return () => { cancelled = true; };
+  }, [wsUrl]);
+
+  useEffect(() => {
+    if (!resolvedUrl) return;
     const container = containerRef.current;
     if (!container) return;
 
@@ -38,7 +51,8 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     placeholder.textContent = "Connecting…";
     container.appendChild(placeholder);
 
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(resolvedUrl);
+    ws.binaryType = "arraybuffer"; // ensure binary frames arrive as ArrayBuffer not Blob
 
     ws.onopen = () => {
       placeholder.remove();
@@ -80,8 +94,17 @@ export default function AnsiLog({ wsUrl, className }: Props) {
     return () => {
       ws.close();
       if (container) container.innerHTML = "";
+      // Reset the ANSI converter so stale escape-sequence state doesn't bleed
+      // into the next connection.
+      converterRef.current = new AnsiToHtml({
+        fg: "#a3e635",
+        bg: "#020617",
+        newline: false,
+        escapeXML: true,
+        stream: true,
+      });
     };
-  }, [wsUrl]);
+  }, [resolvedUrl]);
 
   return (
     <div

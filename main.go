@@ -21,13 +21,19 @@ var version = "dev"
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":8080", "HTTP listen address")
-		dataDir  = flag.String("data", "./data", "Data directory for SQLite database")
-		imgName  = flag.String("image", "ghcr.io/naiba/cloudcode-base:latest", "Docker image name for opencode instances")
-		noDocker = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
-		corsOrigin = flag.String("cors-origin", "", "Allowed CORS origin for dev (e.g. http://localhost:3000)")
+		addr            = flag.String("addr", ":8080", "HTTP listen address")
+		dataDir         = flag.String("data", "./data", "Data directory for SQLite database")
+		imgName         = flag.String("image", "ghcr.io/naiba/cloudcode-base:latest", "Docker image name for opencode instances")
+		noDocker        = flag.Bool("no-docker", false, "Skip Docker initialization (for UI preview)")
+		corsOrigin      = flag.String("cors-origin", "", "Allowed CORS origin for dev (e.g. http://localhost:3000)")
+		accessToken     = flag.String("access-token", "", "Required bearer token / password for accessing the platform")
+		proxyCORSOrigin = flag.String("proxy-cors-origin", "*", "CORS Access-Control-Allow-Origin injected into proxied instance responses")
 	)
 	flag.Parse()
+
+	if *accessToken == "" {
+		log.Fatal("--access-token is required. Set a strong secret token to protect the platform.")
+	}
 
 	_ = version
 
@@ -64,8 +70,8 @@ func main() {
 		log.Println("Docker disabled (--no-docker), container operations will fail")
 	}
 
-	rp := proxy.New()
-	h := handler.New(db, dm, rp, cfgMgr)
+	rp := proxy.New(*proxyCORSOrigin)
+	h := handler.New(db, dm, rp, cfgMgr, *accessToken, *corsOrigin)
 
 	mux := http.NewServeMux()
 
@@ -108,7 +114,8 @@ func corsMiddleware(origin string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

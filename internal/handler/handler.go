@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,12 +25,18 @@ import (
 	"github.com/naiba/cloudcode/internal/store"
 )
 
+const sessionCookieName = "_cc_session"
+
 type Handler struct {
-	store    *store.Store
-	docker   *docker.Manager
-	proxy    *proxy.ReverseProxy
-	config   *config.Manager
-	portPool *PortPool
+	store       *store.Store
+	docker      *docker.Manager
+	proxy       *proxy.ReverseProxy
+	config      *config.Manager
+	portPool    *PortPool
+	accessToken string
+	corsOrigin  string   // allowed dev origin for WS CheckOrigin
+	sessions    sync.Map // sessionID (string) → struct{}
+	wsTokens    sync.Map // one-time WS token (string) → struct{}
 }
 
 // PortPool allocates ports for new instances.
@@ -66,13 +75,15 @@ func (pp *PortPool) MarkUsed(port int) {
 	pp.used[port] = true
 }
 
-func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager) *Handler {
+func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager, accessToken, corsOrigin string) *Handler {
 	h := &Handler{
-		store:    s,
-		docker:   dm,
-		proxy:    rp,
-		config:   cfgMgr,
-		portPool: NewPortPool(10000, 10100),
+		store:       s,
+		docker:      dm,
+		proxy:       rp,
+		config:      cfgMgr,
+		portPool:    NewPortPool(10000, 10100),
+		accessToken: accessToken,
+		corsOrigin:  corsOrigin,
 	}
 
 	instances, err := s.List()
@@ -92,38 +103,181 @@ func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *con
 
 // RegisterRoutes sets up all HTTP routes.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	// --- Instances API ---
-	mux.HandleFunc("GET /api/instances", h.apiListInstances)
-	mux.HandleFunc("POST /api/instances", h.apiCreateInstance)
-	mux.HandleFunc("GET /api/instances/{id}", h.apiGetInstance)
-	mux.HandleFunc("DELETE /api/instances/{id}", h.apiDeleteInstance)
-	mux.HandleFunc("POST /api/instances/{id}/start", h.apiStartInstance)
-	mux.HandleFunc("POST /api/instances/{id}/stop", h.apiStopInstance)
-	mux.HandleFunc("POST /api/instances/{id}/restart", h.apiRestartInstance)
-	mux.HandleFunc("GET /api/instances/{id}/status", h.apiInstanceStatus)
+	// --- Auth routes (public — no session required) ---
+	mux.HandleFunc("POST /api/auth/login", h.apiAuthLogin)
+	mux.HandleFunc("POST /api/auth/logout", h.apiAuthLogout)
+	// WS token: protected (requires session), used by browser to get a one-time
+	// token it can pass as ?token= on cross-origin WebSocket connections.
+	mux.Handle("GET /api/auth/ws-token", h.auth(http.HandlerFunc(h.apiAuthWSToken)))
 
-	// --- System API ---
-	mux.HandleFunc("GET /api/system/resources", h.apiSystemResources)
+	// --- Instances API (protected) ---
+	mux.Handle("GET /api/instances", h.auth(http.HandlerFunc(h.apiListInstances)))
+	mux.Handle("POST /api/instances", h.auth(http.HandlerFunc(h.apiCreateInstance)))
+	mux.Handle("GET /api/instances/{id}", h.auth(http.HandlerFunc(h.apiGetInstance)))
+	mux.Handle("DELETE /api/instances/{id}", h.auth(http.HandlerFunc(h.apiDeleteInstance)))
+	mux.Handle("POST /api/instances/{id}/start", h.auth(http.HandlerFunc(h.apiStartInstance)))
+	mux.Handle("POST /api/instances/{id}/stop", h.auth(http.HandlerFunc(h.apiStopInstance)))
+	mux.Handle("POST /api/instances/{id}/restart", h.auth(http.HandlerFunc(h.apiRestartInstance)))
+	mux.Handle("GET /api/instances/{id}/status", h.auth(http.HandlerFunc(h.apiInstanceStatus)))
 
-	// --- Settings API ---
-	mux.HandleFunc("GET /api/settings", h.apiGetSettings)
-	mux.HandleFunc("PUT /api/settings/env", h.apiSaveEnvVars)
-	mux.HandleFunc("GET /api/settings/file", h.apiGetConfigFile)
-	mux.HandleFunc("PUT /api/settings/file", h.apiSaveConfigFile)
-	mux.HandleFunc("GET /api/settings/dir-files", h.apiListDirFiles)
-	mux.HandleFunc("PUT /api/settings/dir-file", h.apiSaveDirFile)
-	mux.HandleFunc("DELETE /api/settings/dir-file", h.apiDeleteDirFile)
-	mux.HandleFunc("DELETE /api/settings/agents-skill", h.apiDeleteAgentsSkill)
+	// --- Batch status (protected) ---
+	mux.Handle("POST /api/instances/status", h.auth(http.HandlerFunc(h.apiBatchInstanceStatus)))
 
-	// --- WebSocket endpoints (unchanged) ---
+	// --- System API (protected) ---
+	mux.Handle("GET /api/system/resources", h.auth(http.HandlerFunc(h.apiSystemResources)))
+
+	// --- Settings API (protected) ---
+	mux.Handle("GET /api/settings", h.auth(http.HandlerFunc(h.apiGetSettings)))
+	mux.Handle("PUT /api/settings/env", h.auth(http.HandlerFunc(h.apiSaveEnvVars)))
+	mux.Handle("GET /api/settings/file", h.auth(http.HandlerFunc(h.apiGetConfigFile)))
+	mux.Handle("PUT /api/settings/file", h.auth(http.HandlerFunc(h.apiSaveConfigFile)))
+	mux.Handle("GET /api/settings/dir-files", h.auth(http.HandlerFunc(h.apiListDirFiles)))
+	mux.Handle("PUT /api/settings/dir-file", h.auth(http.HandlerFunc(h.apiSaveDirFile)))
+	mux.Handle("DELETE /api/settings/dir-file", h.auth(http.HandlerFunc(h.apiDeleteDirFile)))
+	mux.Handle("DELETE /api/settings/agents-skill", h.auth(http.HandlerFunc(h.apiDeleteAgentsSkill)))
+
+	// --- WebSocket endpoints (protected via cookie OR one-time ?token=) ---
 	mux.HandleFunc("GET /instances/{id}/logs/ws", h.handleLogsWS)
 	mux.HandleFunc("GET /instances/{id}/terminal/ws", h.handleTerminalWS)
 
-	// --- Reverse proxy to OpenCode web UI ---
-	mux.HandleFunc("/instance/{id}/", h.handleProxy)
+	// --- Reverse proxy to OpenCode web UI (protected) ---
+	mux.Handle("/instance/{id}/", h.auth(http.HandlerFunc(h.handleProxy)))
 
-	// --- Catch-all: SPA asset fallback (must be last) ---
+	// --- Catch-all: SPA asset fallback / proxy fallback (must be last) ---
+	// Public for /login route (SPA handles it); protected for all other paths.
 	mux.HandleFunc("/", h.handleCatchAll)
+}
+
+// --- Auth helpers ---
+
+// newSessionID generates a cryptographically random 32-byte hex session ID.
+func newSessionID() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// auth is the authentication middleware. It checks for a valid session cookie.
+// For /api/* paths it returns 401 JSON on failure; for browser paths it redirects to /login.
+func (h *Handler) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.isAuthenticated(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/instances/") {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		http.Redirect(w, r, "/login", http.StatusFound)
+	})
+}
+
+// isAuthenticated returns true if the request carries a valid session cookie.
+func (h *Handler) isAuthenticated(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	_, ok := h.sessions.Load(c.Value)
+	return ok
+}
+
+// isAuthenticatedWS returns true for WebSocket upgrade requests.
+// It accepts either the session cookie OR a one-time ?token= query parameter
+// (consumed on first use) to support cross-origin WS from the dev frontend.
+func (h *Handler) isAuthenticatedWS(r *http.Request) bool {
+	if h.isAuthenticated(r) {
+		return true
+	}
+	return h.consumeWSToken(r.URL.Query().Get("token"))
+}
+
+// setSessionCookie writes the session cookie to the response.
+func (h *Handler) setSessionCookie(w http.ResponseWriter, r *http.Request, sessionID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400 * 30, // 30 days
+	})
+}
+
+// clearSessionCookie expires the session cookie.
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+}
+
+// --- Auth API handlers ---
+
+func (h *Handler) apiAuthLogin(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Constant-time comparison to prevent timing attacks.
+	tokenMatch := subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.accessToken)) == 1
+	if !tokenMatch {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return
+	}
+
+	sessionID, err := newSessionID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+
+	h.sessions.Store(sessionID, struct{}{})
+	h.setSessionCookie(w, r, sessionID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) apiAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		h.sessions.Delete(c.Value)
+	}
+	clearSessionCookie(w)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// apiAuthWSToken issues a single-use token for WebSocket authentication.
+// The browser fetches this (with its session cookie, via the same-origin proxy)
+// and passes it as ?token= on the cross-origin WebSocket URL to the Go backend.
+// Tokens are consumed on first use and never reused.
+func (h *Handler) apiAuthWSToken(w http.ResponseWriter, r *http.Request) {
+	token, err := newSessionID() // reuse same CSPRNG helper
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	h.wsTokens.Store(token, struct{}{})
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+}
+
+// consumeWSToken checks and atomically removes a one-time WS token.
+func (h *Handler) consumeWSToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	_, ok := h.wsTokens.LoadAndDelete(token)
+	return ok
 }
 
 // --- Helpers ---
@@ -441,6 +595,85 @@ func (h *Handler) apiInstanceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, inst)
 }
 
+// apiBatchInstanceStatus checks multiple instances at once and returns only
+// those whose status differs from the client's known status, plus any that
+// have been deleted (returned as {"id": null}).
+//
+// Request:  POST /api/instances/status
+//
+//	{"ids": {"<id>": "<clientStatus>", ...}}
+//
+// Response: 200 {"changed": {"<id>": <Instance|null>, ...}}
+//
+//	Only IDs whose status changed (or were deleted) appear in the response.
+func (h *Handler) apiBatchInstanceStatus(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		IDs map[string]string `json:"ids"` // id → clientStatus
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"changed": map[string]any{}})
+		return
+	}
+
+	type result struct {
+		id      string
+		inst    *store.Instance // nil means deleted
+		changed bool
+	}
+
+	results := make(chan result, len(req.IDs))
+	var wg sync.WaitGroup
+
+	for id, clientStatus := range req.IDs {
+		wg.Add(1)
+		go func(id, clientStatus string) {
+			defer wg.Done()
+			inst, err := h.store.Get(id)
+			if err != nil {
+				// Not found → deleted
+				results <- result{id: id, inst: nil, changed: true}
+				return
+			}
+			// Sync with Docker if possible
+			if inst.ContainerID != "" && h.docker != nil {
+				if status, err := h.docker.ContainerStatus(r.Context(), inst.ContainerID); err == nil && status != inst.Status {
+					inst.Status = status
+					if updateErr := h.store.Update(inst); updateErr != nil {
+						log.Printf("Warning: failed to update instance %s status: %v", inst.ID, updateErr)
+					}
+				}
+			}
+			if inst.Status != clientStatus {
+				results <- result{id: id, inst: inst, changed: true}
+			} else {
+				results <- result{id: id, inst: inst, changed: false}
+			}
+		}(id, clientStatus)
+	}
+
+	wg.Wait()
+	close(results)
+
+	changed := map[string]any{}
+	for res := range results {
+		if !res.changed {
+			continue
+		}
+		if res.inst == nil {
+			changed[res.id] = nil
+		} else {
+			changed[res.id] = res.inst
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"changed": changed})
+}
+
 // --- System API ---
 
 func (h *Handler) apiSystemResources(w http.ResponseWriter, r *http.Request) {
@@ -677,21 +910,35 @@ func (h *Handler) apiDeleteAgentsSkill(w http.ResponseWriter, r *http.Request) {
 
 // --- WebSocket handlers (unchanged) ---
 
-var wsUpgrader = websocket.Upgrader{
-	// Allow same-host connections only. When Origin header is absent (e.g. native
-	// WebSocket clients / curl) we also allow, matching the net/http default.
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		// Accept if Origin matches the Host header (scheme-insensitive).
-		host := r.Host
-		return strings.EqualFold(strings.TrimPrefix(strings.TrimPrefix(origin, "https://"), "http://"), host)
-	},
+// wsUpgrader returns a WebSocket upgrader that allows same-host origins
+// plus an optional extra allowed origin (e.g. the dev frontend server).
+func (h *Handler) wsUpgrader() *websocket.Upgrader {
+	return &websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			// Always accept same-host origins (scheme-insensitive).
+			host := r.Host
+			bareOrigin := strings.TrimPrefix(strings.TrimPrefix(origin, "https://"), "http://")
+			if strings.EqualFold(bareOrigin, host) {
+				return true
+			}
+			// Also accept the configured CORS origin (e.g. dev frontend at :4000).
+			if h.corsOrigin != "" && strings.EqualFold(origin, h.corsOrigin) {
+				return true
+			}
+			return false
+		},
+	}
 }
 
 func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthenticatedWS(r) {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
@@ -704,7 +951,7 @@ func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	conn, err := h.wsUpgrader().Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade failed for logs: %v", err)
 		return
@@ -748,6 +995,10 @@ func (h *Handler) handleLogsWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthenticatedWS(r) {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
 	if err != nil {
@@ -760,7 +1011,7 @@ func (h *Handler) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	conn, err := h.wsUpgrader().Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade failed: %v", err)
 		return
@@ -858,6 +1109,27 @@ func (h *Handler) handleCatchAll(w http.ResponseWriter, r *http.Request) {
 	// If it's an API path that wasn't matched, return 404 JSON
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+
+	// /instance/{id} without trailing slash — redirect to /instance/{id}/ so it
+	// hits the registered handleProxy route. This happens when a reverse proxy or
+	// browser strips the trailing slash before forwarding.
+	if strings.HasPrefix(r.URL.Path, "/instance/") && !strings.HasSuffix(r.URL.Path, "/") {
+		http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
+		return
+	}
+
+	// /login is always public — serve the SPA so it can render the login page.
+	isLoginPage := r.URL.Path == "/login" || r.URL.Path == "/login/"
+	if !isLoginPage && !h.isAuthenticated(r) {
+		// Check if this is a proxied asset request needing auth
+		if instanceID := h.resolveInstanceID(r); instanceID != "" {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		// Browser navigation to any protected SPA route → redirect to /login
+		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
 
