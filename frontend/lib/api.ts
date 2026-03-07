@@ -19,6 +19,8 @@ export interface Instance {
   work_dir: string;
   memory_mb: number;
   cpu_cores: number;
+  /** Per-instance env vars. Values are always masked as "***" by the API. */
+  env_vars: Record<string, string>;
   access_token: string;
   created_at: string;
   updated_at: string;
@@ -58,6 +60,7 @@ export interface Settings {
   };
   agents_skills: AgentsSkill[];
   directory_mappings: { host: string; container: string }[];
+  startup_script: string;
 }
 
 export interface SystemResources {
@@ -220,6 +223,8 @@ export const api = {
       name: string;
       memory_mb?: number;
       cpu_cores?: number;
+      /** Per-instance env vars. Keys must match [A-Za-z_][A-Za-z0-9_]*. Override global Settings vars. */
+      env_vars?: Record<string, string>;
     }): Promise<Instance> {
       return request("POST", "/api/instances", payload);
     },
@@ -238,6 +243,14 @@ export const api = {
 
     restart(id: string): Promise<Instance> {
       return request("POST", `/api/instances/${id}/restart`);
+    },
+
+    /** Replaces per-instance env vars. Returns the updated instance (values masked). Restart required to apply. */
+    updateEnvVars(
+      id: string,
+      env_vars: Record<string, string>
+    ): Promise<Instance> {
+      return request("PATCH", `/api/instances/${id}/env-vars`, { env_vars });
     },
 
     /** Generates a new access token for the instance. Returns the new token. */
@@ -346,6 +359,10 @@ export const api = {
         "DELETE",
         `/api/settings/agents-skill?name=${encodeURIComponent(name)}`
       );
+    },
+
+    saveStartupScript(script: string): Promise<void> {
+      return request("PUT", "/api/settings/startup-script", { script });
     },
   },
 };

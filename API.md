@@ -137,6 +137,7 @@ const ws = new WebSocket(`ws://localhost:8080/instances/${id}/logs/ws?token=${en
   "work_dir":     "/root",
   "memory_mb":    2048,
   "cpu_cores":    2.0,
+  "env_vars":     { "ANTHROPIC_API_KEY": "***", "GH_TOKEN": "***" },
   "created_at":   "2026-03-05T01:37:44Z",
   "updated_at":   "2026-03-05T01:38:10Z"
 }
@@ -152,11 +153,10 @@ const ws = new WebSocket(`ws://localhost:8080/instances/${id}/logs/ws?token=${en
 | `work_dir` | string | Working directory inside the container (always `/root`) |
 | `memory_mb` | integer | Memory limit in MB; `0` = unlimited |
 | `cpu_cores` | number | CPU core limit (fractional allowed); `0` = unlimited |
+| `env_vars` | object | Per-instance environment variables. **Values are always masked as `"***"` in API responses.** Keys are visible so users can confirm what is set. These override global Settings env vars with the same key inside this instance's container. |
 | `access_token` | string | Per-instance access token. Required to open the web UI or connect via SDK. |
 | `created_at` | string | ISO 8601 timestamp |
 | `updated_at` | string | ISO 8601 timestamp |
-
-> **Note:** `env_vars` is intentionally excluded from all API responses to prevent leaking secrets. Env vars are managed via the Settings API.
 
 ### Per-instance access token
 
@@ -236,7 +236,8 @@ Blocks until the container is running or fails.
 {
   "name":       "my-project",
   "memory_mb":  2048,
-  "cpu_cores":  2.0
+  "cpu_cores":  2.0,
+  "env_vars":   { "ANTHROPIC_API_KEY": "sk-ant-...", "GH_TOKEN": "ghp_..." }
 }
 ```
 
@@ -245,6 +246,7 @@ Blocks until the container is running or fails.
 | `name` | string | yes | — | Whitespace trimmed; must be non-empty after trim |
 | `memory_mb` | integer | no | `0` | `0` = unlimited |
 | `cpu_cores` | number | no | `0` | `0` = unlimited |
+| `env_vars` | object | no | `{}` | Per-instance env vars injected into the container. Keys must be valid POSIX names (`[A-Za-z_][A-Za-z0-9_]*`). These override global Settings env vars with the same key for this instance only. Applied on every container start/restart. |
 
 **Response `201`:** Instance object. `status` is `"running"` on success or `"error"` if the container failed to start (the record is still saved).
 
@@ -252,6 +254,7 @@ Blocks until the container is running or fails.
 ```json
 { "error": "name is required" }
 { "error": "invalid request body" }
+{ "error": "invalid env var key \"123BAD\": must match [A-Za-z_][A-Za-z0-9_]*" }
 ```
 
 **Response `409`:**
@@ -767,7 +770,7 @@ Accepts a comma-separated list. The matched request `Origin` is reflected back (
 
 ```
 Access-Control-Allow-Origin: <matched origin>
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 Access-Control-Allow-Headers: Content-Type, Authorization
 Access-Control-Allow-Credentials: true
 ```
