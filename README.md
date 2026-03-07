@@ -1,6 +1,6 @@
 # CloudCode
 
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go)](https://go.dev)
 [![Docker](https://img.shields.io/badge/Docker-Required-2496ED?logo=docker)](https://www.docker.com)
 
 A self-hosted management platform for [OpenCode](https://opencode.ai) instances. Spin up multiple isolated OpenCode environments as Docker containers and manage them through a single web dashboard.
@@ -10,6 +10,8 @@ A self-hosted management platform for [OpenCode](https://opencode.ai) instances.
 - **Token-based access control** — Single admin token gates all API, WebSocket, and proxy routes; session cookie issued on login
 - **Multi-instance management** — Create, start, stop, restart, and delete OpenCode instances
 - **Configurable resource limits** — Set memory and CPU limits per instance at creation time, or leave unlimited
+- **Per-instance env vars** — Override global environment variables for individual instances; values stored and displayed in plain text in the management portal
+- **Global startup script** — Paste a shell script in Settings → Startup Script; it runs automatically inside every container before OpenCode launches, on every start/restart
 - **Session isolation** — Each instance has its own workspace; auth tokens are shared globally
 - **Shared global config** — Manage `opencode.jsonc`, `AGENTS.md`, auth tokens, custom commands, agents, skills, and plugins from a unified Settings UI
 - **skills.sh integration** — Install [skills.sh](https://skills.sh) skills inside any container, shared across all instances
@@ -17,6 +19,7 @@ A self-hosted management platform for [OpenCode](https://opencode.ai) instances.
 - **Auto-updating containers** — OpenCode + Oh My OpenCode updated on each container start
 - **Cloudflare Tunnel built-in** — Each container ships with `cloudflared` pre-installed; expose any local service to the public internet with a single command, no port forwarding needed
 - **Playwright Chromium** — Pre-installed in each container with symlinks at `/usr/bin/chromium-browser` and `/usr/bin/chrome`
+- **Python & uv** — Python 3 and the `uv` package manager pre-installed in every container
 
 ## Quick Start
 
@@ -119,9 +122,10 @@ Global config is managed through the Settings page and bind-mounted into all con
 | `data/config/opencode-data/auth.json` | `/root/.local/share/opencode/auth.json` | Global | Auth tokens (shared across all instances) |
 | `data/config/dot-opencode/` | `/root/.opencode/` | Global | `package.json` |
 | `data/config/agents-skills/` | `/root/.agents/` | Global | Skills installed via [skills.sh](https://skills.sh) |
+| `data/config/startup.sh` | `/root/.config/cloudcode/startup.sh` | Global | Startup script (executed on every container start) |
 | `cloudcode-home-{id}` (volume) | `/root` | Per-instance | Workspace, cloned repos, session data |
 
-Environment variables (e.g. `ANTHROPIC_API_KEY`, `GH_TOKEN`) are configured in Settings and injected into all containers.
+Global environment variables (e.g. `ANTHROPIC_API_KEY`, `GH_TOKEN`) are configured in Settings → Env Vars and injected into all containers. Per-instance env vars can be set at creation or via the instance detail page and override global vars for that instance only.
 
 ### Cloudflare Tunnel (Exposing Local Services)
 
@@ -138,10 +142,10 @@ For persistent tunnels with custom domains, see the [Cloudflare Tunnel documenta
 
 ## Tech Stack
 
-- **Backend**: Go 1.25, `net/http` stdlib router, SQLite (via `modernc.org/sqlite`, pure Go no CGO)
+- **Backend**: Go 1.24, `net/http` stdlib router, SQLite (via `modernc.org/sqlite`, pure Go no CGO)
 - **Frontend**: Next.js 16 App Router, TypeScript, Tailwind CSS v4, xterm.js for terminal, DOMPurify for log sanitization
 - **Containers**: Docker SDK (`github.com/moby/moby/client`)
-- **Base Image**: Ubuntu 24.04 + Go + Node 22 + Bun + OpenCode + oh-my-opencode
+- **Base Image**: Ubuntu 24.04 + Go 1.24 + Node 22 + Bun + Python 3 + uv + OpenCode + oh-my-opencode
 
 ## Development
 
@@ -195,7 +199,7 @@ docker build -t cloudcode:latest -f Dockerfile.platform .
 - **Session management** — Existing session invalidated on re-login; sessions stored in memory (cleared on restart)
 - **WS tokens** — One-time tokens for cross-origin WebSocket auth; 60s TTL, pruned by background goroutine
 - **Path traversal protection** — All config file operations validated by `containedPath`; `dirName` restricted to an allowlist
-- **No secret leakage** — `env_vars` excluded from all instance API responses; `auth.json` content excluded from the default settings response (load-on-demand via `GET /api/settings/file`)
+- **No secret leakage** — `auth.json` content excluded from the default settings response (load-on-demand via `GET /api/settings/file`)
 - **XSS prevention** — Log output sanitized with DOMPurify before DOM insertion
 - **Request limits** — Bodies limited to 1–10 MB via `http.MaxBytesReader`; logs WebSocket read limit 512 bytes
 - **Security headers** — SPA responses include `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, and `Content-Security-Policy`
