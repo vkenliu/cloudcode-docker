@@ -21,7 +21,7 @@ internal/
   store/store.go                 SQLite persistence (instance CRUD)
 docker/
   Dockerfile                     Base image (Ubuntu 24.04 + Go + Node 22 + Bun + OpenCode)
-  entrypoint.sh                  Container startup script (updates deps + starts opencode web)
+  entrypoint.sh                  Container startup script (updates deps + runs startup.sh + starts opencode web)
 Dockerfile.platform              Multi-stage platform image build
 frontend/                        Next.js 16 App Router (TypeScript + Tailwind CSS v4)
   app/                           Pages: dashboard, instance detail, terminal, settings, new instance
@@ -66,7 +66,7 @@ bun run build   # in frontend/
 
 ## Code Style
 
-- **Go 1.25**, `net/http` stdlib router (`mux.HandleFunc("GET /path", handler)`), no web framework
+- **Go 1.24**, `net/http` stdlib router (`mux.HandleFunc("GET /path", handler)`), no web framework
 - **modernc.org/sqlite** (pure Go, no CGO), JSON fields stored as `TEXT`
 - **Next.js 16** App Router, TypeScript, Tailwind CSS v4, no additional UI frameworks
 - Terminal uses xterm.js (local npm import, not CDN)
@@ -101,6 +101,23 @@ Each instance has a unique 32-byte hex `access_token` stored in the DB. It is en
 opencode attach http://your-cloudcode-host/instance/{id}/ --password {access_token}
 ```
 
+### Per-Instance Env Vars
+
+Each instance can have its own `env_vars` map (stored in SQLite). These are merged with global Settings env vars at container creation time — instance values override global values for the same key. Values are stored and returned in plain text (management portal, no masking).
+
+- Set at creation via `POST /api/instances` → `env_vars` field
+- Updated at any time via `PATCH /api/instances/{id}/env-vars`
+- Applied on every start/restart (requires restart to take effect in a running container)
+
+### Global Startup Script
+
+A single `data/config/startup.sh` is executed inside every container on every startup, after deps are updated and before OpenCode launches. Managed via Settings → Startup Script tab.
+
+- Stored at `data/config/startup.sh` (mode `0750`)
+- Bind-mounted read-only at `/root/.config/cloudcode/startup.sh`
+- Only mounted/executed if the file exists and is non-empty
+- Runs as `bash`; runs with `set -euo pipefail` from the outer entrypoint
+
 ### WebSocket
 
 - Uses `github.com/gorilla/websocket`
@@ -119,6 +136,7 @@ opencode attach http://your-cloudcode-host/instance/{id}/ --password {access_tok
 | `{dataDir}/config/opencode-data/auth.json` (bind mount) | `/root/.local/share/opencode/auth.json` | Global | Auth tokens (shared across all instances) |
 | `{dataDir}/config/dot-opencode/` (bind mount) | `/root/.opencode/` | Global | package.json |
 | `{dataDir}/config/agents-skills/` (bind mount) | `/root/.agents/` | Global | skills.sh-installed skills and lock file |
+| `{dataDir}/config/startup.sh` (bind mount) | `/root/.config/cloudcode/startup.sh` | Global | User startup script (executed on every container start) |
 | `cloudcode-home-{id}` (named volume) | `/root` | Per-instance | Workspace, cloned repos, session data, databases |
 
 The `commands/`, `agents/`, `skills/`, and `plugins/` subdirectories are managed via the Settings page.
@@ -146,7 +164,7 @@ The `_cc_inst` cookie is global (`Path=/`), so only one instance's Web UI is act
 - All instances share global config; writes inside a container affect all instances (bind mount is read-write)
 - No port pool — containers publish to `127.0.0.1:0` (Docker assigns a random loopback port)
 - Resource limits: memory (MB) and CPU (cores) configurable at creation; 0 = unlimited
-- Base image: Ubuntu 24.04 + Go 1.23 + Node 22 + Bun
+- Base image: Ubuntu 24.04 + Go 1.24 + Node 22 + Bun + Python 3 + uv
 - `oh-my-opencode` installed globally via `bun install -g`
 - `cloudflared` pre-installed in each container
 - Playwright Chromium pre-installed, symlinked to `/usr/bin/chromium-browser` and `/usr/bin/chrome`
@@ -158,3 +176,4 @@ The `_cc_inst` cookie is global (`Path=/`), so only one instance's Web UI is act
 - After changing frontend: run `bun run build` in `frontend/`
 - New routes: add to `RegisterRoutes` in `handler.go` following existing format
 - New config files: update the relevant slices and `EditableFiles()` in `config.go`
+- New bind mounts: add to `ContainerMountsForInstance` in `config.go` and document in the Config Layout table above

@@ -128,13 +128,23 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 		env = append(env, fmt.Sprintf("OPENCODE_SERVER_PASSWORD=%s", inst.AccessToken))
 	}
 
+	// Merge env vars: start with global settings, then let per-instance vars
+	// override them. This means a per-instance ANTHROPIC_API_KEY will shadow
+	// the one set in Settings without affecting other instances.
+	merged := make(map[string]string)
 	if m.config != nil {
-		globalEnv, err := m.config.GetEnvVars()
-		if err == nil {
+		if globalEnv, err := m.config.GetEnvVars(); err == nil {
 			for k, v := range globalEnv {
-				env = append(env, fmt.Sprintf("%s=%s", k, v))
+				merged[k] = v
 			}
 		}
+	}
+	// Per-instance vars override globals for the same key.
+	for k, v := range inst.EnvVars {
+		merged[k] = v
+	}
+	for k, v := range merged {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	// Named volume for /root (persists across container recreations)

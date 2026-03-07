@@ -22,6 +22,7 @@ const (
 	DirDotOpenCode    = "dot-opencode"  // → /root/.opencode/
 	DirAgentsSkills   = "agents-skills" // → /root/.agents/
 	FileEnvVars       = "env.json"
+	FileStartupScript = "startup.sh" // executed by entrypoint on every container start
 )
 
 var OpenCodeConfigFiles = []string{
@@ -228,6 +229,25 @@ func (m *Manager) SetEnvVars(env map[string]string) error {
 	return os.WriteFile(filepath.Join(m.rootDir, FileEnvVars), data, 0600)
 }
 
+// GetStartupScript returns the contents of startup.sh, or empty string if it doesn't exist.
+func (m *Manager) GetStartupScript() (string, error) {
+	p := filepath.Join(m.rootDir, FileStartupScript)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(data), nil
+}
+
+// SetStartupScript writes content to startup.sh and makes it executable.
+func (m *Manager) SetStartupScript(content string) error {
+	p := filepath.Join(m.rootDir, FileStartupScript)
+	return os.WriteFile(p, []byte(content), 0750)
+}
+
 // ReadFile reads a config file by relPath (e.g. "opencode/opencode.jsonc").
 // Returns empty string if file doesn't exist.
 // #1: validates path stays within rootDir.
@@ -272,7 +292,7 @@ func (m *Manager) ContainerMountsForInstance(instanceID string) ([]ContainerMoun
 		root = m.hostRootDir
 	}
 
-	return []ContainerMount{
+	mounts := []ContainerMount{
 		{
 			HostPath:      filepath.Join(root, DirOpenCodeConfig),
 			ContainerPath: "/root/.config/opencode",
@@ -289,7 +309,19 @@ func (m *Manager) ContainerMountsForInstance(instanceID string) ([]ContainerMoun
 			HostPath:      filepath.Join(root, DirAgentsSkills),
 			ContainerPath: "/root/.agents",
 		},
-	}, nil
+	}
+
+	// Mount startup.sh only if it exists and is non-empty.
+	startupPath := filepath.Join(m.rootDir, FileStartupScript)
+	if info, err := os.Stat(startupPath); err == nil && info.Size() > 0 {
+		hostStartupPath := filepath.Join(root, FileStartupScript)
+		mounts = append(mounts, ContainerMount{
+			HostPath:      hostStartupPath,
+			ContainerPath: "/root/.config/cloudcode/startup.sh",
+		})
+	}
+
+	return mounts, nil
 }
 
 func (m *Manager) RemoveInstanceData(instanceID string) {

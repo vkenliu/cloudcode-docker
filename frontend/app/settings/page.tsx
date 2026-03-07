@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Settings, EnvVar, DirFile } from "@/lib/api";
+import { api, Settings, EnvVar, DirFile, AgentsSkill } from "@/lib/api";
 
 // Stable ID for env var rows so React keys don't depend on array index (#34)
 let _uidCounter = 0;
@@ -145,9 +145,12 @@ function EnvVarsEditor({
 function ConfigFileEditor({
   relPath,
   initialContent,
+  agentsSkill,
 }: {
   relPath: string;
   initialContent: string;
+  /** When true, saves via the __agents-skill__ dir marker instead of the normal file write path */
+  agentsSkill?: boolean;
 }) {
   const [content, setContent] = useState(initialContent);
   const [busy, setBusy] = useState(false);
@@ -167,7 +170,11 @@ function ConfigFileEditor({
     setBusy(true);
     setError("");
     try {
-      await api.settings.saveFile(relPath, content);
+      if (agentsSkill) {
+        await api.settings.saveDirFile({ dir: "__agents-skill__", filename: relPath, content });
+      } else {
+        await api.settings.saveFile(relPath, content);
+      }
       setSaved(true);
       dirtyRef.current = false; // #33: mark clean after save
       setTimeout(() => setSaved(false), 2000);
@@ -184,6 +191,71 @@ function ConfigFileEditor({
         value={content}
         onChange={(e) => { dirtyRef.current = true; setContent(e.target.value); }}
         rows={16}
+        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
+        spellCheck={false}
+      />
+      {error && <div className="text-red-400 text-xs">{error}</div>}
+      <div>
+        <SaveBtn busy={busy} saved={saved} onClick={save} />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// Startup script editor
+// ============================================================
+
+function StartupScriptEditor({
+  initialScript,
+  onSaved,
+}: {
+  initialScript: string;
+  onSaved: () => void;
+}) {
+  const [script, setScript] = useState(initialScript);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const dirtyRef = useRef(false);
+
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      setScript(initialScript);
+    }
+  }, [initialScript]);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.settings.saveStartupScript(script);
+      setSaved(true);
+      dirtyRef.current = false;
+      setTimeout(() => setSaved(false), 2000);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="text-sm text-slate-400">
+        Shell script executed automatically on every container startup, before
+        OpenCode launches. Runs as <code className="text-slate-300 bg-slate-900 px-1 py-0.5 rounded text-xs">bash</code>.
+        Applied to all instances on next restart.
+      </div>
+      <textarea
+        value={script}
+        onChange={(e) => {
+          dirtyRef.current = true;
+          setScript(e.target.value);
+        }}
+        rows={20}
+        placeholder={"#!/bin/bash\n# Example: install a global package\nnpm install -g some-tool\n"}
         className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
         spellCheck={false}
       />
@@ -361,11 +433,105 @@ function DirFileManager({
 }
 
 // ============================================================
+// Agents Skills panel
+// ============================================================
+
+function AgentsSkillsPanel({
+  skills,
+  onChanged,
+}: {
+  skills: AgentsSkill[];
+  onChanged: () => void;
+}) {
+  const [editing, setEditing] = useState<{ relPath: string; skillName: string; content: string } | null>(null);
+  const [loadError, setLoadError] = useState("");
+
+  const openEdit = async (s: AgentsSkill) => {
+    setLoadError("");
+    try {
+      const result = await api.settings.readFile(s.rel_path);
+      setEditing({ relPath: s.rel_path, skillName: s.skill_name, content: result.content });
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setEditing(null)}
+            className="text-xs text-slate-400 hover:text-white"
+          >
+            ← Back
+          </button>
+          <span className="text-sm font-mono text-slate-300">{editing.skillName} / SKILL.md</span>
+        </div>
+        <ConfigFileEditor
+          key={editing.relPath}
+          relPath={editing.relPath}
+          initialContent={editing.content}
+          agentsSkill
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="text-sm text-slate-400">
+        Skills installed via{" "}
+        <code className="text-slate-300 bg-slate-900 px-1 py-0.5 rounded text-xs">skills.sh</code>
+        . Shared across all instances.
+      </div>
+      {loadError && <div className="text-red-400 text-xs">{loadError}</div>}
+      {skills.length === 0 ? (
+        <div className="text-slate-500 text-sm">No skills installed.</div>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {skills.map((s) => (
+            <div
+              key={s.rel_path}
+              className="flex items-center gap-3 group py-1 px-2 rounded hover:bg-slate-700"
+            >
+              <span className="flex-1 text-sm font-mono text-slate-300">{s.skill_name}</span>
+              <span className="text-xs text-slate-500 font-mono">{s.rel_path}</span>
+              <button
+                onClick={() => openEdit(s)}
+                className="opacity-0 group-hover:opacity-100 text-xs text-blue-400 hover:text-blue-300 px-2 py-0.5"
+              >
+                Edit
+              </button>
+              <button
+                onClick={async () => {
+                  if (!confirm(`Delete skill "${s.skill_name}"?`)) return;
+                  try {
+                    await api.settings.deleteAgentsSkill(s.skill_name);
+                    onChanged();
+                  } catch (e) {
+                    alert(e instanceof Error ? e.message : String(e));
+                  }
+                }}
+                className="opacity-0 group-hover:opacity-100 text-xs text-red-400 hover:text-red-300 px-2 py-0.5"
+              >
+                Delete
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // Settings page
 // ============================================================
 
 type TabKey =
   | "env"
+  | "startup-script"
   | "config-files"
   | "commands"
   | "agents"
@@ -400,6 +566,7 @@ export default function SettingsPage() {
 
   const tabs: { key: TabKey; label: string }[] = [
     { key: "env", label: "Env Vars" },
+    { key: "startup-script", label: "Startup Script" },
     { key: "config-files", label: "Config Files" },
     { key: "commands", label: "Commands" },
     { key: "agents", label: "Agents" },
@@ -464,6 +631,14 @@ export default function SettingsPage() {
           </div>
         )}
 
+        {/* --- Startup Script --- */}
+        {activeTab === "startup-script" && (
+          <StartupScriptEditor
+            initialScript={settings.startup_script ?? ""}
+            onSaved={loadSettings}
+          />
+        )}
+
         {/* --- Config Files --- */}
         {activeTab === "config-files" && (
           <div>
@@ -506,7 +681,7 @@ export default function SettingsPage() {
                   <ConfigFileEditor
                     key={cf.rel_path}
                     relPath={cf.rel_path}
-                    initialContent={cf.content}
+                    initialContent={cf.content ?? ""}
                   />
                 </div>
               );
@@ -532,53 +707,10 @@ export default function SettingsPage() {
 
         {/* --- Agents Skills --- */}
         {activeTab === "agents-skills" && (
-          <div>
-            <div className="text-sm text-slate-400 mb-4">
-              Skills installed via{" "}
-              <code className="text-slate-300 bg-slate-900 px-1 py-0.5 rounded text-xs">
-                skills.sh
-              </code>
-              . Shared across all instances.
-            </div>
-            {settings.agents_skills.length === 0 ? (
-              <div className="text-slate-500 text-sm">No skills installed.</div>
-            ) : (
-              <div className="flex flex-col gap-1">
-                {settings.agents_skills.map((s) => (
-                  <div
-                    key={s.rel_path}
-                    className="flex items-center gap-3 group py-1 px-2 rounded hover:bg-slate-700"
-                  >
-                    <span className="flex-1 text-sm font-mono text-slate-300">
-                      {s.skill_name}
-                    </span>
-                    <span className="text-xs text-slate-500 font-mono">
-                      {s.rel_path}
-                    </span>
-                    <button
-                      onClick={async () => {
-                        if (
-                          !confirm(`Delete skill "${s.skill_name}"?`)
-                        )
-                          return;
-                        try {
-                          await api.settings.deleteAgentsSkill(s.skill_name);
-                          loadSettings();
-                        } catch (e) {
-                          alert(
-                            e instanceof Error ? e.message : String(e)
-                          );
-                        }
-                      }}
-                      className="opacity-0 group-hover:opacity-100 text-xs text-red-400 hover:text-red-300 px-2 py-0.5"
-                    >
-                      Delete
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+          <AgentsSkillsPanel
+            skills={settings.agents_skills}
+            onChanged={loadSettings}
+          />
         )}
 
         {/* --- Directory Mappings --- */}

@@ -27,7 +27,6 @@ function TokenField({ instanceId, token }: { instanceId: string; token: string }
   const [regenerating, setRegenerating] = useState(false);
   const [currentToken, setCurrentToken] = useState(token);
 
-  // L10: sync local state when parent updates the token (e.g. after status poll)
   useEffect(() => {
     setCurrentToken(token);
   }, [token]);
@@ -92,6 +91,176 @@ function TokenField({ instanceId, token }: { instanceId: string; token: string }
   );
 }
 
+// ---- Env vars editor --------------------------------------------------------
+
+interface EnvEntry {
+  key: string;
+  value: string;
+}
+
+function EnvVarsEditor({
+  instanceId,
+  initialEnvVars,
+  onSaved,
+}: {
+  instanceId: string;
+  initialEnvVars: Record<string, string>;
+  onSaved: (updated: Instance) => void;
+}) {
+  const [entries, setEntries] = useState<EnvEntry[]>(() =>
+    Object.entries(initialEnvVars).map(([k, v]) => ({ key: k, value: v }))
+  );
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saveOk, setSaveOk] = useState(false);
+
+  // Re-sync rows when the parent fetches an updated instance (e.g. after status poll).
+  // Only add/remove rows for keys that appeared/disappeared; don't overwrite
+  // values the user is currently editing.
+  useEffect(() => {
+    setEntries((prev) => {
+      const existingKeys = new Set(prev.map((e) => e.key));
+      const incomingKeys = new Set(Object.keys(initialEnvVars));
+      // Remove rows for keys that no longer exist
+      const kept = prev.filter((e) => e.key === "" || incomingKeys.has(e.key));
+      // Add rows for new keys (with real values from the API)
+      const added = Object.entries(initialEnvVars)
+        .filter(([k]) => !existingKeys.has(k))
+        .map(([k, v]) => ({ key: k, value: v }));
+      return [...kept, ...added];
+    });
+  }, [initialEnvVars]);
+
+  const addRow = () => setEntries((prev) => [...prev, { key: "", value: "" }]);
+
+  const removeRow = (i: number) =>
+    setEntries((prev) => prev.filter((_, idx) => idx !== i));
+
+  const updateRow = (i: number, field: "key" | "value", val: string) =>
+    setEntries((prev) =>
+      prev.map((e, idx) => (idx === i ? { ...e, [field]: val } : e))
+    );
+
+  const handleSave = async () => {
+    const envKeyRe = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const { key } of entries) {
+      if (key === "") continue;
+      if (!envKeyRe.test(key)) {
+        setSaveError(
+          `Invalid key "${key}". Keys must start with a letter or underscore followed by letters, digits, or underscores.`
+        );
+        return;
+      }
+    }
+    // Deduplicate: last entry for a given key wins
+    const envVars: Record<string, string> = {};
+    for (const { key, value } of entries) {
+      if (key.trim()) envVars[key.trim()] = value;
+    }
+
+    setSaving(true);
+    setSaveError("");
+    setSaveOk(false);
+    try {
+      const updated = await api.instances.updateEnvVars(instanceId, envVars);
+      onSaved(updated);
+      // Sync rows to what the server confirms (removes blanks / dupes), with real values
+      setEntries(
+        Object.entries(updated.env_vars)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, v]) => ({ key: k, value: v }))
+      );
+      setSaveOk(true);
+      setTimeout(() => setSaveOk(false), 3000);
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-slate-500">
+          Override global Settings vars for this instance. Applied on next
+          restart.
+        </p>
+        <button
+          type="button"
+          onClick={addRow}
+          className="text-xs text-blue-400 hover:text-blue-300 transition-colors whitespace-nowrap ml-4"
+        >
+          + Add variable
+        </button>
+      </div>
+
+      {entries.length === 0 ? (
+        <p className="text-xs text-slate-600 italic">
+          No instance-specific variables.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {entries.map((entry, i) => (
+            <div key={i} className="flex gap-2 items-center">
+              <input
+                type="text"
+                value={entry.key}
+                onChange={(e) => updateRow(i, "key", e.target.value)}
+                placeholder="VARIABLE_NAME"
+                className="w-2/5 bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+              />
+              <input
+                type="text"
+                value={entry.value}
+                onChange={(e) => updateRow(i, "value", e.target.value)}
+                placeholder="value"
+                className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+              />
+              <button
+                type="button"
+                onClick={() => removeRow(i)}
+                className="text-slate-500 hover:text-red-400 transition-colors text-lg leading-none px-1"
+                aria-label="Remove"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {saveError && (
+        <p className="text-xs text-red-400 bg-red-950/50 rounded-lg px-3 py-2">
+          {saveError}
+        </p>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-medium rounded-lg transition-colors"
+        >
+          {saving ? "Saving…" : "Save Env Vars"}
+        </button>
+        {saveOk && (
+          <span className="text-xs text-green-400">
+            Saved — restart instance to apply.
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---- Inline log panel -------------------------------------------------------
 
 function LogPanel({ instanceId }: { instanceId: string }) {
@@ -114,13 +283,11 @@ export default function InstanceDetailPage() {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState("");
 
-  // #30: track current status in a ref so polling doesn't use a stale closure
   const currentStatusRef = useRef<string>("");
   useEffect(() => {
     if (instance) currentStatusRef.current = instance.status;
   }, [instance]);
 
-  // #31: track whether we've already navigated away
   const cancelledRef = useRef(false);
 
   // Initial fetch
@@ -132,20 +299,19 @@ export default function InstanceDetailPage() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Status polling — deps only include stable values (id, router) to avoid
-  // restarting the loop on every status change (#30)
+  // Status polling
   useEffect(() => {
-    if (loading) return; // wait for initial fetch
+    if (loading) return;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
-      if (cancelledRef.current) return; // #31
+      if (cancelledRef.current) return;
       try {
-        const result = await api.instances.pollStatus(id, currentStatusRef.current); // #30
-        if (cancelledRef.current) return; // #31
+        const result = await api.instances.pollStatus(id, currentStatusRef.current);
+        if (cancelledRef.current) return;
         if (result === null) {
           // unchanged
         } else if ("deleted" in result) {
-          cancelledRef.current = true; // #31
+          cancelledRef.current = true;
           router.push("/");
           return;
         } else {
@@ -160,7 +326,7 @@ export default function InstanceDetailPage() {
     return () => {
       clearTimeout(timer);
     };
-  }, [id, loading, router]); // #30: no longer depends on `instance`
+  }, [id, loading, router]);
 
   const doAction = async (action: "start" | "stop" | "restart") => {
     setBusy(true);
@@ -208,6 +374,8 @@ export default function InstanceDetailPage() {
     instance.status === "stopped" ||
     instance.status === "exited" ||
     instance.status === "created";
+
+  const envVars = instance.env_vars ?? {};
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -262,7 +430,6 @@ export default function InstanceDetailPage() {
             Start
           </button>
         )}
-        {/* #32: only show Restart when the instance is in a restartable state */}
         {(isRunning || isStopped) && (
           <button
             disabled={busy}
@@ -338,6 +505,21 @@ export default function InstanceDetailPage() {
           </div>
         )}
         <TokenField instanceId={instance.id} token={instance.access_token} />
+      </div>
+
+      {/* Environment Variables editor */}
+      <div className="bg-slate-800 border border-slate-700 rounded-xl p-6 mb-6">
+        <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide mb-1">
+          Instance Env Vars
+        </h2>
+        <p className="text-xs text-slate-500 mb-4">
+          These override global Settings env vars for this instance only.
+        </p>
+        <EnvVarsEditor
+          instanceId={instance.id}
+          initialEnvVars={envVars}
+          onSaved={setInstance}
+        />
       </div>
 
       {/* Logs */}

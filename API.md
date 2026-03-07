@@ -133,10 +133,11 @@ const ws = new WebSocket(`ws://localhost:8080/instances/${id}/logs/ws?token=${en
   "container_id": "14302ee2393541cc2eaf...",
   "status":       "running",
   "error_msg":    "",
-  "port":         10008,
   "work_dir":     "/root",
   "memory_mb":    2048,
   "cpu_cores":    2.0,
+  "env_vars":     { "ANTHROPIC_API_KEY": "sk-ant-...", "GH_TOKEN": "ghp_..." },
+  "access_token": "a3f9...",
   "created_at":   "2026-03-05T01:37:44Z",
   "updated_at":   "2026-03-05T01:38:10Z"
 }
@@ -152,11 +153,10 @@ const ws = new WebSocket(`ws://localhost:8080/instances/${id}/logs/ws?token=${en
 | `work_dir` | string | Working directory inside the container (always `/root`) |
 | `memory_mb` | integer | Memory limit in MB; `0` = unlimited |
 | `cpu_cores` | number | CPU core limit (fractional allowed); `0` = unlimited |
+| `env_vars` | object | Per-instance environment variables (plain text). These override global Settings env vars with the same key inside this instance's container. |
 | `access_token` | string | Per-instance access token. Required to open the web UI or connect via SDK. |
 | `created_at` | string | ISO 8601 timestamp |
 | `updated_at` | string | ISO 8601 timestamp |
-
-> **Note:** `env_vars` is intentionally excluded from all API responses to prevent leaking secrets. Env vars are managed via the Settings API.
 
 ### Per-instance access token
 
@@ -236,7 +236,8 @@ Blocks until the container is running or fails.
 {
   "name":       "my-project",
   "memory_mb":  2048,
-  "cpu_cores":  2.0
+  "cpu_cores":  2.0,
+  "env_vars":   { "ANTHROPIC_API_KEY": "sk-ant-...", "GH_TOKEN": "ghp_..." }
 }
 ```
 
@@ -245,6 +246,7 @@ Blocks until the container is running or fails.
 | `name` | string | yes | — | Whitespace trimmed; must be non-empty after trim |
 | `memory_mb` | integer | no | `0` | `0` = unlimited |
 | `cpu_cores` | number | no | `0` | `0` = unlimited |
+| `env_vars` | object | no | `{}` | Per-instance env vars injected into the container. Keys must be valid POSIX names (`[A-Za-z_][A-Za-z0-9_]*`). These override global Settings env vars with the same key for this instance only. Applied on every container start/restart. |
 
 **Response `201`:** Instance object. `status` is `"running"` on success or `"error"` if the container failed to start (the record is still saved).
 
@@ -252,6 +254,7 @@ Blocks until the container is running or fails.
 ```json
 { "error": "name is required" }
 { "error": "invalid request body" }
+{ "error": "invalid env var key \"123BAD\": must match [A-Za-z_][A-Za-z0-9_]*" }
 ```
 
 **Response `409`:**
@@ -272,6 +275,40 @@ Generates a new `access_token` for the instance and updates the DB and proxy imm
 **Response `200`:**
 ```json
 { "access_token": "new64charhextoken..." }
+```
+
+**Response `404`:**
+```json
+{ "error": "instance not found" }
+```
+
+---
+
+### Update instance env vars
+
+```
+PATCH /api/instances/{id}/env-vars
+```
+
+Replaces the per-instance env vars map entirely. Keys must be valid POSIX names (`[A-Za-z_][A-Za-z0-9_]*`). The container must be restarted for changes to take effect.
+
+**Request body:**
+```json
+{
+  "env_vars": {
+    "ANTHROPIC_API_KEY": "sk-ant-...",
+    "GH_TOKEN": "ghp_..."
+  }
+}
+```
+
+To clear all per-instance vars: `{"env_vars": {}}`
+
+**Response `200`:** Updated Instance object
+
+**Response `400`:**
+```json
+{ "error": "invalid env var key \"123BAD\": must match [A-Za-z_][A-Za-z0-9_]*" }
 ```
 
 **Response `404`:**
@@ -590,7 +627,8 @@ Returns all global settings data needed to render the settings page.
     { "host": "/path/to/data/config/opencode-data/auth.json", "container": "/root/.local/share/opencode/auth.json" },
     { "host": "/path/to/data/config/dot-opencode/",           "container": "/root/.opencode/" },
     { "host": "/path/to/data/config/agents-skills/",          "container": "/root/.agents/" }
-  ]
+  ],
+  "startup_script": "#!/bin/bash\necho hello\n"
 }
 ```
 
@@ -598,6 +636,7 @@ Returns all global settings data needed to render the settings page.
 - `env_vars` is an array (not a map); order is not guaranteed.
 - `dirs.plugins` always contains `_cloudcode-instructions.md` (written on every server start). Treat it as a read-only built-in in the UI.
 - `config_files[].content` is `null` for `auth.json` — load it on-demand with `GET /api/settings/file`.
+- `startup_script` is the raw shell script content; empty string if not set.
 
 ---
 
@@ -758,6 +797,29 @@ Removes an entire skill directory from `data/config/agents-skills/skills/{name}/
 
 ---
 
+### Save startup script
+
+```
+PUT /api/settings/startup-script
+```
+
+Saves the global startup script to `data/config/startup.sh` (mode `0750`). The script is bind-mounted read-only into every container at `/root/.config/cloudcode/startup.sh` and executed by `bash` on every container start, after dependency updates and before OpenCode launches.
+
+The mount is only added when the file exists and is non-empty — saving an empty string effectively disables the script.
+
+**Request body:**
+```json
+{
+  "script": "#!/bin/bash\nnpm install -g some-tool\n"
+}
+```
+
+To disable: `{"script": ""}`
+
+**Response `204`:** No body
+
+---
+
 ## CORS
 
 ### API CORS (`--cors-origin`)
@@ -767,7 +829,7 @@ Accepts a comma-separated list. The matched request `Origin` is reflected back (
 
 ```
 Access-Control-Allow-Origin: <matched origin>
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
 Access-Control-Allow-Headers: Content-Type, Authorization
 Access-Control-Allow-Credentials: true
 ```
@@ -796,6 +858,7 @@ Used in dev when the frontend runs on a different port:
 | `POST` | `/api/instances/{id}/stop` | session | Stop instance (blocks up to 30s) |
 | `POST` | `/api/instances/{id}/restart` | session | Restart instance (recreates container) |
 | `POST` | `/api/instances/{id}/regenerate-token` | session | Generate a new per-instance access token |
+| `PATCH` | `/api/instances/{id}/env-vars` | session | Replace per-instance env vars |
 | `GET` | `/api/instances/{id}/status?s=` | session | Poll single status (204 if unchanged) |
 | `POST` | `/api/status/instances` | session | Batch poll statuses (returns only changed) |
 | `GET` | `/api/system/resources` | session | Host memory + CPU totals |
@@ -809,6 +872,7 @@ Used in dev when the frontend runs on a different port:
 | `PUT` | `/api/settings/dir-file` | session | Create/update dir file |
 | `DELETE` | `/api/settings/dir-file?path=` | session | Delete dir file |
 | `DELETE` | `/api/settings/agents-skill?name=` | session | Delete agents skill directory |
+| `PUT` | `/api/settings/startup-script` | session | Save global startup script |
 | `GET` | `/instance/{id}/` | session + instance token | Proxy to OpenCode Web UI (trailing slash required; `?token=` or cookie or Bearer) |
 | `GET` | `/login` | public | Login page (SPA) |
 | `GET` | `/` (catch-all) | mixed | API 404 / proxy fallback / SPA index |

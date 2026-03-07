@@ -5,12 +5,18 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, SystemResources, Instance, instanceOpenUrl } from "@/lib/api";
 
+interface EnvEntry {
+  key: string;
+  value: string;
+}
+
 export default function NewInstancePage() {
   const router = useRouter();
   const [resources, setResources] = useState<SystemResources | null>(null);
   const [name, setName] = useState("");
   const [memoryMb, setMemoryMb] = useState(2048);
   const [cpuCores, setCpuCores] = useState(2);
+  const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [created, setCreated] = useState<Instance | null>(null);
@@ -20,13 +26,24 @@ export default function NewInstancePage() {
     api.system.resources().then(setResources).catch(() => null);
   }, []);
 
+  // Env var editor helpers
+  const addEnvRow = () =>
+    setEnvEntries((prev) => [...prev, { key: "", value: "" }]);
+
+  const removeEnvRow = (i: number) =>
+    setEnvEntries((prev) => prev.filter((_, idx) => idx !== i));
+
+  const updateEnvRow = (i: number, field: "key" | "value", val: string) =>
+    setEnvEntries((prev) =>
+      prev.map((entry, idx) => (idx === i ? { ...entry, [field]: val } : entry))
+    );
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
       setError("Name is required");
       return;
     }
-    // L9: guard against NaN from cleared number inputs (Number("") === NaN)
     if (!Number.isFinite(memoryMb) || memoryMb < 0) {
       setError("Memory must be a non-negative number (0 = unlimited)");
       return;
@@ -35,6 +52,25 @@ export default function NewInstancePage() {
       setError("CPU cores must be a non-negative number (0 = unlimited)");
       return;
     }
+
+    // Validate env var keys before sending
+    const envKeyRe = /^[A-Za-z_][A-Za-z0-9_]*$/;
+    for (const { key } of envEntries) {
+      if (key === "") continue; // skip blank rows
+      if (!envKeyRe.test(key)) {
+        setError(
+          `Invalid env var key "${key}". Keys must start with a letter or underscore, followed by letters, digits, or underscores.`
+        );
+        return;
+      }
+    }
+
+    // Build env_vars map (skip rows with blank keys)
+    const env_vars: Record<string, string> = {};
+    for (const { key, value } of envEntries) {
+      if (key.trim()) env_vars[key.trim()] = value;
+    }
+
     setBusy(true);
     setError("");
     try {
@@ -42,8 +78,8 @@ export default function NewInstancePage() {
         name: name.trim(),
         memory_mb: memoryMb,
         cpu_cores: cpuCores,
+        env_vars,
       });
-      // Show the token before navigating — the user must save it.
       setCreated(inst);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -190,6 +226,67 @@ export default function NewInstancePage() {
             className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
           />
           <p className="text-xs text-slate-500 mt-1">0 = unlimited</p>
+        </div>
+
+        {/* Environment Variables */}
+        <div>
+          <div className="flex items-center justify-between mb-1.5">
+            <label className="text-sm font-medium text-slate-300">
+              Environment Variables
+            </label>
+            <button
+              type="button"
+              onClick={addEnvRow}
+              className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+            >
+              + Add variable
+            </button>
+          </div>
+          <p className="text-xs text-slate-500 mb-2">
+            Override global Settings env vars for this instance only. Applied on
+            every start / restart.
+          </p>
+
+          {envEntries.length === 0 ? (
+            <div className="text-xs text-slate-600 italic">
+              No instance-specific variables — global Settings vars apply.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {envEntries.map((entry, i) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <input
+                    type="text"
+                    value={entry.key}
+                    onChange={(e) => updateEnvRow(i, "key", e.target.value)}
+                    placeholder="VARIABLE_NAME"
+                    className="w-2/5 bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                  />
+                  <input
+                    type="password"
+                    value={entry.value}
+                    onChange={(e) => updateEnvRow(i, "value", e.target.value)}
+                    placeholder="value"
+                    className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-2.5 py-1.5 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeEnvRow(i)}
+                    className="text-slate-500 hover:text-red-400 transition-colors text-lg leading-none px-1"
+                    aria-label="Remove"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {error && (

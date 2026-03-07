@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -31,6 +32,10 @@ var instanceIDRe = regexp.MustCompile(`^[0-9a-f]{8}$`)
 // instanceNameRe mirrors the frontend pattern: letters, digits, hyphens, underscores, 1–64 chars.
 var instanceNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
+// envVarKeyRe validates POSIX env var names: start with letter or underscore,
+// followed by letters, digits, or underscores.
+var envVarKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 const sessionCookieName = "_cc_session"
 
 // wsTokenEntry holds a one-time WebSocket auth token with its creation time.
@@ -50,10 +55,10 @@ type Handler struct {
 	config        *config.Manager
 	spaFS         fs.FS
 	accessToken   string
-	corsOrigins   []string  // allowed dev origins for WS CheckOrigin
-	sessions      sync.Map  // sessionID (string) → sessionEntry
-	wsTokens      sync.Map  // one-time WS token (string) → wsTokenEntry
-	loginAttempts sync.Map  // IP (string) → *loginState
+	corsOrigins   []string      // allowed dev origins for WS CheckOrigin
+	sessions      sync.Map      // sessionID (string) → sessionEntry
+	wsTokens      sync.Map      // one-time WS token (string) → wsTokenEntry
+	loginAttempts sync.Map      // IP (string) → *loginState
 	done          chan struct{} // closed on shutdown to stop background goroutines
 }
 
@@ -204,6 +209,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/instances/{id}/restart", h.auth(http.HandlerFunc(h.apiRestartInstance)))
 	mux.Handle("GET /api/instances/{id}/status", h.auth(http.HandlerFunc(h.apiInstanceStatus)))
 	mux.Handle("POST /api/instances/{id}/regenerate-token", h.auth(http.HandlerFunc(h.apiRegenerateToken)))
+	mux.Handle("PATCH /api/instances/{id}/env-vars", h.auth(http.HandlerFunc(h.apiUpdateInstanceEnvVars)))
 
 	// --- Batch status (protected) ---
 	mux.Handle("POST /api/status/instances", h.auth(http.HandlerFunc(h.apiBatchInstanceStatus)))
@@ -214,6 +220,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// --- Settings API (protected) ---
 	mux.Handle("GET /api/settings", h.auth(http.HandlerFunc(h.apiGetSettings)))
 	mux.Handle("PUT /api/settings/env", h.auth(http.HandlerFunc(h.apiSaveEnvVars)))
+	mux.Handle("PUT /api/settings/startup-script", h.auth(http.HandlerFunc(h.apiSaveStartupScript)))
 	mux.Handle("GET /api/settings/file", h.auth(http.HandlerFunc(h.apiGetConfigFile)))
 	mux.Handle("PUT /api/settings/file", h.auth(http.HandlerFunc(h.apiSaveConfigFile)))
 	mux.Handle("GET /api/settings/dir-files", h.auth(http.HandlerFunc(h.apiListDirFiles)))
@@ -417,22 +424,22 @@ func (h *Handler) consumeWSToken(token string) bool {
 	return ok && time.Since(e.createdAt) <= wsTokenTTL
 }
 
-// instanceResponse is a safe subset of store.Instance for API responses.
-// EnvVars is deliberately omitted to avoid leaking API keys and secrets.
+// instanceResponse is the API response shape for a store.Instance.
 // AccessToken is included so authenticated users can retrieve the token for
 // SDK access or to pass to opencode attach.
 type instanceResponse struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	ContainerID string  `json:"container_id"`
-	Status      string  `json:"status"`
-	ErrorMsg    string  `json:"error_msg"`
-	WorkDir     string  `json:"work_dir"`
-	MemoryMB    int     `json:"memory_mb"`
-	CPUCores    float64 `json:"cpu_cores"`
-	AccessToken string  `json:"access_token"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	ContainerID string            `json:"container_id"`
+	Status      string            `json:"status"`
+	ErrorMsg    string            `json:"error_msg"`
+	WorkDir     string            `json:"work_dir"`
+	MemoryMB    int               `json:"memory_mb"`
+	CPUCores    float64           `json:"cpu_cores"`
+	EnvVars     map[string]string `json:"env_vars"`
+	AccessToken string            `json:"access_token"`
+	CreatedAt   string            `json:"created_at"`
+	UpdatedAt   string            `json:"updated_at"`
 }
 
 func toInstanceResponse(inst *store.Instance) instanceResponse {
@@ -445,6 +452,7 @@ func toInstanceResponse(inst *store.Instance) instanceResponse {
 		WorkDir:     inst.WorkDir,
 		MemoryMB:    inst.MemoryMB,
 		CPUCores:    inst.CPUCores,
+		EnvVars:     inst.EnvVars,
 		AccessToken: inst.AccessToken,
 		CreatedAt:   inst.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:   inst.UpdatedAt.Format(time.RFC3339),
@@ -528,9 +536,10 @@ func (h *Handler) apiGetInstance(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiCreateInstance(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit (#17)
 	var req struct {
-		Name     string  `json:"name"`
-		MemoryMB int     `json:"memory_mb"`
-		CPUCores float64 `json:"cpu_cores"`
+		Name     string            `json:"name"`
+		MemoryMB int               `json:"memory_mb"`
+		CPUCores float64           `json:"cpu_cores"`
+		EnvVars  map[string]string `json:"env_vars"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -560,12 +569,23 @@ func (h *Handler) apiCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate and sanitise per-instance env vars.
+	// Keys must be valid POSIX env var names; empty keys/values are rejected.
+	envVars := make(map[string]string)
+	for k, v := range req.EnvVars {
+		if !envVarKeyRe.MatchString(k) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid env var key %q: must match [A-Za-z_][A-Za-z0-9_]*", k))
+			return
+		}
+		envVars[k] = v
+	}
+
 	inst := &store.Instance{
 		Name:        req.Name,
 		Status:      "created",
 		Port:        docker.ContainerPort(),
 		WorkDir:     "/root",
-		EnvVars:     make(map[string]string),
+		EnvVars:     envVars,
 		MemoryMB:    req.MemoryMB,
 		CPUCores:    req.CPUCores,
 		AccessToken: accessToken,
@@ -896,6 +916,45 @@ func (h *Handler) apiBatchInstanceStatus(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"changed": changed})
 }
 
+// apiUpdateInstanceEnvVars replaces the per-instance env vars with the provided map.
+// The new vars are persisted to the DB immediately. The container must be restarted
+// for the changes to take effect (env vars are injected at container creation time).
+func (h *Handler) apiUpdateInstanceEnvVars(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inst, err := h.store.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "instance not found")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		EnvVars map[string]string `json:"env_vars"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate keys
+	envVars := make(map[string]string, len(req.EnvVars))
+	for k, v := range req.EnvVars {
+		if !envVarKeyRe.MatchString(k) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid env var key %q: must match [A-Za-z_][A-Za-z0-9_]*", k))
+			return
+		}
+		envVars[k] = v
+	}
+
+	inst.EnvVars = envVars
+	if err := h.store.Update(inst); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update env vars")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toInstanceResponse(inst))
+}
+
 // apiRegenerateToken generates a new access token for an instance.
 // The new token is stored in the DB, the proxy registration is updated, and the
 // new token is returned in the response. The instance must be authenticated with
@@ -1041,13 +1100,17 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		{Host: filepath.Join(configDir, "agents-skills") + "/", Container: "/root/.agents/"},
 	}
 
+	// Startup script
+	startupScript, _ := h.config.GetStartupScript()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"config_dir":          configDir,
-		"env_vars":            envVars,
-		"config_files":        configFiles,
-		"dirs":                dirs,
-		"agents_skills":       agentsSkills,
-		"directory_mappings":  mappings,
+		"config_dir":         configDir,
+		"env_vars":           envVars,
+		"config_files":       configFiles,
+		"dirs":               dirs,
+		"agents_skills":      agentsSkills,
+		"directory_mappings": mappings,
+		"startup_script":     startupScript,
 	})
 }
 
@@ -1075,6 +1138,22 @@ func (h *Handler) apiSaveEnvVars(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.config.SetEnvVars(env); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save environment variables: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSaveStartupScript(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
+	var req struct {
+		Script string `json:"script"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.config.SetStartupScript(req.Script); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save startup script: "+err.Error())
 		return
 	}
 	writeNoContent(w)
@@ -1177,16 +1256,25 @@ func (h *Handler) apiSaveDirFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "dir and filename are required")
 		return
 	}
-	if !validDirNames[req.Dir] {
-		writeError(w, http.StatusBadRequest, "invalid dir: must be one of commands, agents, skills, plugins")
-		return
+
+	// Special marker used by the frontend to edit agents-skills files (e.g.
+	// agents-skills/skills/foo/SKILL.md). In this case Filename is already
+	// the full relPath returned by ListAgentsSkills; containedPath validates it.
+	var relPath string
+	if req.Dir == "__agents-skill__" {
+		relPath = req.Filename
+	} else {
+		if !validDirNames[req.Dir] {
+			writeError(w, http.StatusBadRequest, "invalid dir: must be one of commands, agents, skills, plugins")
+			return
+		}
+		// M13: validate filename — no path separators, no NUL, reasonable length.
+		if strings.ContainsAny(req.Filename, "/\\\x00") || len(req.Filename) > 255 || req.Filename == "." || req.Filename == ".." {
+			writeError(w, http.StatusBadRequest, "invalid filename")
+			return
+		}
+		relPath = filepath.Join(config.DirOpenCodeConfig, req.Dir, req.Filename)
 	}
-	// M13: validate filename — no path separators, no NUL, reasonable length.
-	if strings.ContainsAny(req.Filename, "/\\\x00") || len(req.Filename) > 255 || req.Filename == "." || req.Filename == ".." {
-		writeError(w, http.StatusBadRequest, "invalid filename")
-		return
-	}
-	relPath := filepath.Join(config.DirOpenCodeConfig, req.Dir, req.Filename)
 	if err := h.config.WriteFile(relPath, req.Content); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save file: "+err.Error())
 		return
