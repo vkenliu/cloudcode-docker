@@ -145,10 +145,13 @@ function EnvVarsEditor({
 function ConfigFileEditor({
   relPath,
   initialContent,
+  lazyLoad,
   agentsSkill,
 }: {
   relPath: string;
   initialContent: string;
+  /** When true, fetches content on mount via readFile (for auth.json etc.) */
+  lazyLoad?: boolean;
   /** When true, saves via the __agents-skill__ dir marker instead of the normal file write path */
   agentsSkill?: boolean;
 }) {
@@ -156,6 +159,7 @@ function ConfigFileEditor({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [loadingContent, setLoadingContent] = useState(false);
   // #33: track whether user has made unsaved edits
   const dirtyRef = useRef(false);
 
@@ -165,6 +169,17 @@ function ConfigFileEditor({
       setContent(initialContent);
     }
   }, [initialContent]);
+
+  // Lazy-load content on mount for files where the settings endpoint returns null.
+  useEffect(() => {
+    if (!lazyLoad) return;
+    setLoadingContent(true);
+    api.settings
+      .readFile(relPath)
+      .then((res) => setContent(res.content))
+      .catch(() => {}) // file may not exist yet
+      .finally(() => setLoadingContent(false));
+  }, [lazyLoad, relPath]);
 
   const save = async () => {
     setBusy(true);
@@ -187,13 +202,19 @@ function ConfigFileEditor({
 
   return (
     <div className="flex flex-col gap-2">
-      <textarea
-        value={content}
-        onChange={(e) => { dirtyRef.current = true; setContent(e.target.value); }}
-        rows={16}
-        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
-        spellCheck={false}
-      />
+      {loadingContent ? (
+        <div className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-500 h-[22rem] flex items-center justify-center">
+          Loading...
+        </div>
+      ) : (
+        <textarea
+          value={content}
+          onChange={(e) => { dirtyRef.current = true; setContent(e.target.value); }}
+          rows={16}
+          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
+          spellCheck={false}
+        />
+      )}
       {error && <div className="text-red-400 text-xs">{error}</div>}
       <div>
         <SaveBtn busy={busy} saved={saved} onClick={save} />
@@ -870,6 +891,7 @@ export default function SettingsPage() {
                     key={cf.rel_path}
                     relPath={cf.rel_path}
                     initialContent={cf.content ?? ""}
+                    lazyLoad={cf.content === null}
                   />
                 </div>
               );

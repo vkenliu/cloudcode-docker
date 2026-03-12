@@ -79,7 +79,10 @@ type Manager struct {
 }
 
 func NewManager(dataDir string) (*Manager, error) {
-	rootDir := filepath.Join(dataDir, "config")
+	rootDir, err := filepath.Abs(filepath.Join(dataDir, "config"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve config root: %w", err)
+	}
 	m := &Manager{rootDir: rootDir}
 
 	if hostDataDir := os.Getenv("HOST_DATA_DIR"); hostDataDir != "" {
