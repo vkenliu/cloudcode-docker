@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, instanceOpenUrl, Instance } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
-import { statusColor } from "@/lib/utils";
+import { statusColor, formatBytes } from "@/lib/utils";
 
 function Field({ label, value }: { label: string; value: string }) {
   return (
@@ -489,6 +489,14 @@ export default function InstanceDetailPage() {
             instance.cpu_cores === 0
               ? "unlimited"
               : `${instance.cpu_cores} cores`
+          }
+        />
+        <Field
+          label="Disk Usage"
+          value={
+            instance.disk_usage_bytes !== undefined
+              ? formatBytes(instance.disk_usage_bytes)
+              : "..."
           }
         />
         <Field

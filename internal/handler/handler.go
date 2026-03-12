@@ -202,6 +202,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// --- Instances API (protected) ---
 	mux.Handle("GET /api/instances", h.auth(http.HandlerFunc(h.apiListInstances)))
 	mux.Handle("POST /api/instances", h.auth(http.HandlerFunc(h.apiCreateInstance)))
+	mux.Handle("GET /api/instances/disk-usage", h.auth(http.HandlerFunc(h.apiDiskUsage)))
 	mux.Handle("GET /api/instances/{id}", h.auth(http.HandlerFunc(h.apiGetInstance)))
 	mux.Handle("DELETE /api/instances/{id}", h.auth(http.HandlerFunc(h.apiDeleteInstance)))
 	mux.Handle("POST /api/instances/{id}/start", h.auth(http.HandlerFunc(h.apiStartInstance)))
@@ -227,6 +228,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("PUT /api/settings/dir-file", h.auth(http.HandlerFunc(h.apiSaveDirFile)))
 	mux.Handle("DELETE /api/settings/dir-file", h.auth(http.HandlerFunc(h.apiDeleteDirFile)))
 	mux.Handle("DELETE /api/settings/agents-skill", h.auth(http.HandlerFunc(h.apiDeleteAgentsSkill)))
+	mux.Handle("PUT /api/settings/cors", h.auth(http.HandlerFunc(h.apiSaveCORSOrigins)))
+	mux.Handle("PUT /api/settings/recycling", h.auth(http.HandlerFunc(h.apiSaveRecyclingPolicy)))
 
 	// --- WebSocket endpoints (protected via cookie OR one-time ?token=) ---
 	mux.HandleFunc("GET /instances/{id}/logs/ws", h.handleLogsWS)
@@ -428,18 +431,19 @@ func (h *Handler) consumeWSToken(token string) bool {
 // AccessToken is included so authenticated users can retrieve the token for
 // SDK access or to pass to opencode attach.
 type instanceResponse struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	ContainerID string            `json:"container_id"`
-	Status      string            `json:"status"`
-	ErrorMsg    string            `json:"error_msg"`
-	WorkDir     string            `json:"work_dir"`
-	MemoryMB    int               `json:"memory_mb"`
-	CPUCores    float64           `json:"cpu_cores"`
-	EnvVars     map[string]string `json:"env_vars"`
-	AccessToken string            `json:"access_token"`
-	CreatedAt   string            `json:"created_at"`
-	UpdatedAt   string            `json:"updated_at"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	ContainerID    string            `json:"container_id"`
+	Status         string            `json:"status"`
+	ErrorMsg       string            `json:"error_msg"`
+	WorkDir        string            `json:"work_dir"`
+	MemoryMB       int               `json:"memory_mb"`
+	CPUCores       float64           `json:"cpu_cores"`
+	EnvVars        map[string]string `json:"env_vars"`
+	AccessToken    string            `json:"access_token"`
+	DiskUsageBytes *int64            `json:"disk_usage_bytes,omitempty"` // nil = not fetched, -1 = unavailable
+	CreatedAt      string            `json:"created_at"`
+	UpdatedAt      string            `json:"updated_at"`
 }
 
 func toInstanceResponse(inst *store.Instance) instanceResponse {
@@ -530,7 +534,16 @@ func (h *Handler) apiGetInstance(w http.ResponseWriter, r *http.Request) {
 			_ = h.store.Update(inst)
 		}
 	}
-	writeJSON(w, http.StatusOK, toInstanceResponse(inst))
+	resp := toInstanceResponse(inst)
+	// Attach disk usage from cached volume data.
+	if h.docker != nil {
+		if usage, err := h.docker.VolumeDiskUsage(r.Context()); err == nil {
+			if size, ok := usage[inst.ID]; ok {
+				resp.DiskUsageBytes = &size
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) apiCreateInstance(w http.ResponseWriter, r *http.Request) {
@@ -655,12 +668,12 @@ func (h *Handler) apiDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if inst.ContainerID != "" && h.docker != nil {
-		// Use a separate timeout context — we want the removal to complete even
-		// if the HTTP client disconnects, but we don't want it to block forever.
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		// Use a background context so the removal completes even if the HTTP
+		// client disconnects — we don't want orphaned containers or volumes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := h.docker.RemoveContainerAndVolume(ctx, inst.ContainerID, id); err != nil {
-			log.Printf("Error removing container for %s: %v", id, err)
+			log.Printf("Error removing container/volume for %s: %v", id, err)
 		}
 	}
 
@@ -685,6 +698,65 @@ func (h *Handler) apiDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeNoContent(w)
+}
+
+// enforceRecyclingPolicy checks the recycling policy and removes the oldest
+// inactive (stopped/exited/error) instances if they exceed the configured
+// maximum. Runs in the background so it does not block the caller.
+func (h *Handler) enforceRecyclingPolicy() {
+	go func() {
+		policy, err := h.config.GetRecyclingPolicy()
+		if err != nil || !policy.Enabled {
+			return
+		}
+
+		instances, err := h.store.List()
+		if err != nil {
+			log.Printf("Warning: recycling policy: failed to list instances: %v", err)
+			return
+		}
+
+		// Collect inactive instances (stopped, exited, error), ordered by
+		// created_at DESC (newest first) because store.List returns that order.
+		var inactive []*store.Instance
+		for _, inst := range instances {
+			if inst.Status == "stopped" || inst.Status == "exited" || inst.Status == "error" {
+				inactive = append(inactive, inst)
+			}
+		}
+
+		if len(inactive) <= policy.MaxStoppedCount {
+			return
+		}
+
+		// Remove the oldest ones (tail of the list since list is newest-first).
+		toRemove := inactive[policy.MaxStoppedCount:]
+		for _, inst := range toRemove {
+			log.Printf("Recycling policy: removing inactive instance %s (%s, status=%s)", inst.ID, inst.Name, inst.Status)
+
+			if inst.ContainerID != "" && h.docker != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := h.docker.RemoveContainerAndVolume(ctx, inst.ContainerID, inst.ID); err != nil {
+					log.Printf("Warning: recycling: failed to remove container for %s: %v", inst.ID, err)
+				}
+				cancel()
+			}
+
+			h.proxy.Unregister(inst.ID)
+			h.config.RemoveInstanceData(inst.ID)
+
+			if err := h.store.Delete(inst.ID); err != nil {
+				log.Printf("Warning: recycling: failed to delete instance %s: %v", inst.ID, err)
+			}
+		}
+
+		// Invalidate disk cache since we removed volumes.
+		if h.docker != nil {
+			h.docker.InvalidateDiskCache()
+		}
+
+		log.Printf("Recycling policy: removed %d inactive instance(s)", len(toRemove))
+	}()
 }
 
 func (h *Handler) apiStartInstance(w http.ResponseWriter, r *http.Request) {
@@ -754,6 +826,9 @@ func (h *Handler) apiStopInstance(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Warning: failed to update instance %s: %v", inst.ID, err)
 	}
 	h.proxy.Unregister(id)
+
+	// Check recycling policy in the background.
+	h.enforceRecyclingPolicy()
 
 	writeJSON(w, http.StatusOK, toInstanceResponse(inst))
 }
@@ -901,6 +976,7 @@ func (h *Handler) apiBatchInstanceStatus(w http.ResponseWriter, r *http.Request)
 	close(results)
 
 	changed := map[string]any{}
+	hasNewStopped := false
 	for res := range results {
 		if !res.changed {
 			continue
@@ -910,7 +986,15 @@ func (h *Handler) apiBatchInstanceStatus(w http.ResponseWriter, r *http.Request)
 		} else {
 			r := toInstanceResponse(res.inst)
 			changed[res.id] = r
+			if res.inst.Status == "stopped" || res.inst.Status == "exited" || res.inst.Status == "error" {
+				hasNewStopped = true
+			}
 		}
+	}
+
+	// Trigger recycling if any instance transitioned to an inactive state.
+	if hasNewStopped {
+		h.enforceRecyclingPolicy()
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"changed": changed})
@@ -1015,6 +1099,21 @@ func (h *Handler) apiSystemResources(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiDiskUsage returns a map of instanceID → disk usage bytes for all instances.
+// Uses the Docker volume cache (1-hour TTL) to avoid expensive system-df calls.
+func (h *Handler) apiDiskUsage(w http.ResponseWriter, r *http.Request) {
+	if h.docker == nil {
+		writeJSON(w, http.StatusOK, map[string]int64{})
+		return
+	}
+	usage, err := h.docker.VolumeDiskUsage(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get disk usage: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, usage)
+}
+
 // --- Settings API ---
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -1098,10 +1197,20 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		{Host: filepath.Join(configDir, "opencode-data", "auth.json"), Container: "/root/.local/share/opencode/auth.json"},
 		{Host: filepath.Join(configDir, "dot-opencode") + "/", Container: "/root/.opencode/"},
 		{Host: filepath.Join(configDir, "agents-skills") + "/", Container: "/root/.agents/"},
+		{Host: filepath.Join(configDir, "adit-core") + "/", Container: "/root/.adit-core/"},
 	}
 
 	// Startup script
 	startupScript, _ := h.config.GetStartupScript()
+
+	// CORS origins
+	corsOrigins, _ := h.config.GetCORSOrigins()
+	if corsOrigins == nil {
+		corsOrigins = []string{}
+	}
+
+	// Recycling policy
+	recyclingPolicy, _ := h.config.GetRecyclingPolicy()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"config_dir":         configDir,
@@ -1111,6 +1220,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"agents_skills":      agentsSkills,
 		"directory_mappings": mappings,
 		"startup_script":     startupScript,
+		"cors_origins":       corsOrigins,
+		"recycling_policy":   recyclingPolicy,
 	})
 }
 
@@ -1156,6 +1267,64 @@ func (h *Handler) apiSaveStartupScript(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to save startup script: "+err.Error())
 		return
 	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSaveCORSOrigins(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
+	var req struct {
+		Origins []string `json:"origins"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Deduplicate and trim whitespace.
+	seen := make(map[string]bool)
+	var clean []string
+	for _, o := range req.Origins {
+		o = strings.TrimSpace(o)
+		if o != "" && !seen[strings.ToLower(o)] {
+			seen[strings.ToLower(o)] = true
+			clean = append(clean, o)
+		}
+	}
+	if clean == nil {
+		clean = []string{}
+	}
+	if err := h.config.SetCORSOrigins(clean); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save CORS origins: "+err.Error())
+		return
+	}
+	log.Printf("CORS origins updated: %v", clean)
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSaveRecyclingPolicy(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Enabled         bool `json:"enabled"`
+		MaxStoppedCount int  `json:"max_stopped_count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	policy := config.RecyclingPolicy{
+		Enabled:         req.Enabled,
+		MaxStoppedCount: req.MaxStoppedCount,
+	}
+	if err := h.config.SetRecyclingPolicy(policy); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save recycling policy: "+err.Error())
+		return
+	}
+	log.Printf("Recycling policy updated: enabled=%v max_stopped=%d", policy.Enabled, policy.MaxStoppedCount)
+
+	// Enforce immediately if just enabled.
+	if policy.Enabled {
+		h.enforceRecyclingPolicy()
+	}
+
 	writeNoContent(w)
 }
 
@@ -1329,6 +1498,16 @@ func (h *Handler) wsUpgrader() *websocket.Upgrader {
 			for _, allowed := range h.corsOrigins {
 				if strings.EqualFold(origin, allowed) {
 					return true
+				}
+			}
+			// Check saved CORS origins from config (dynamic, no restart needed).
+			if h.config != nil {
+				if saved, err := h.config.GetCORSOrigins(); err == nil {
+					for _, allowed := range saved {
+						if strings.EqualFold(origin, allowed) {
+							return true
+						}
+					}
 				}
 			}
 			return false

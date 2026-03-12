@@ -76,19 +76,27 @@ func main() {
 		log.Fatalf("Failed to sub embedded SPA: %v", err)
 	}
 
-	corsOrigins := parseOrigins(*corsOrigin)
+	flagOrigins := parseOrigins(*corsOrigin)
+
+	// Load saved CORS origins from config and merge with CLI flag origins.
+	savedOrigins, err := cfgMgr.GetCORSOrigins()
+	if err != nil {
+		log.Printf("Warning: could not read saved CORS origins: %v", err)
+	}
+	allOrigins := mergeOrigins(flagOrigins, savedOrigins)
+	if len(allOrigins) > 0 {
+		log.Printf("CORS enabled for origins: %s", strings.Join(allOrigins, ", "))
+	}
 
 	rp := proxy.New()
-	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, corsOrigins)
+	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, flagOrigins)
 
 	mux := http.NewServeMux()
 
-	// CORS middleware for development
-	var rootHandler http.Handler = mux
-	if len(corsOrigins) > 0 {
-		log.Printf("CORS enabled for origins: %s", strings.Join(corsOrigins, ", "))
-		rootHandler = corsMiddleware(corsOrigins, mux)
-	}
+	// Dynamic CORS middleware — always active so saved origins take effect
+	// without requiring a restart. Checks CLI flag origins (static) plus
+	// config-file origins (re-read on each request).
+	rootHandler := dynamicCORSMiddleware(flagOrigins, cfgMgr, mux)
 
 	h.RegisterRoutes(mux)
 
@@ -139,16 +147,61 @@ func parseOrigins(s string) []string {
 	return out
 }
 
-// corsMiddleware reflects the request Origin back if it is in the allowlist.
-func corsMiddleware(origins []string, next http.Handler) http.Handler {
-	set := make(map[string]struct{}, len(origins))
-	for _, o := range origins {
-		set[strings.ToLower(o)] = struct{}{}
+// mergeOrigins combines two origin slices, deduplicating by lowercase value.
+func mergeOrigins(a, b []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range a {
+		lower := strings.ToLower(strings.TrimSpace(s))
+		if lower != "" && !seen[lower] {
+			seen[lower] = true
+			out = append(out, s)
+		}
 	}
+	for _, s := range b {
+		lower := strings.ToLower(strings.TrimSpace(s))
+		if lower != "" && !seen[lower] {
+			seen[lower] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// dynamicCORSMiddleware checks the request Origin against both the static CLI
+// flag origins and the config-file origins (re-read on each request so that
+// origins saved via the Settings UI take effect without a server restart).
+func dynamicCORSMiddleware(flagOrigins []string, cfgMgr *config.Manager, next http.Handler) http.Handler {
+	// Pre-build a set for the static CLI origins (never changes).
+	flagSet := make(map[string]struct{}, len(flagOrigins))
+	for _, o := range flagOrigins {
+		flagSet[strings.ToLower(o)] = struct{}{}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if _, ok := set[strings.ToLower(origin)]; ok {
+			allowed := false
+			lower := strings.ToLower(origin)
+
+			// Check static CLI origins first (fast path).
+			if _, ok := flagSet[lower]; ok {
+				allowed = true
+			}
+
+			// Check saved config origins.
+			if !allowed {
+				if saved, err := cfgMgr.GetCORSOrigins(); err == nil {
+					for _, s := range saved {
+						if strings.EqualFold(s, origin) {
+							allowed = true
+							break
+						}
+					}
+				}
+			}
+
+			if allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
