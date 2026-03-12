@@ -22,6 +22,8 @@ export interface Instance {
   /** Per-instance env vars. Values are always masked as "***" by the API. */
   env_vars: Record<string, string>;
   access_token: string;
+  /** Disk usage in bytes. undefined = not fetched, -1 = unavailable. */
+  disk_usage_bytes?: number;
   created_at: string;
   updated_at: string;
 }
@@ -61,6 +63,13 @@ export interface Settings {
   agents_skills: AgentsSkill[];
   directory_mappings: { host: string; container: string }[];
   startup_script: string;
+  cors_origins: string[];
+  recycling_policy: RecyclingPolicy;
+}
+
+export interface RecyclingPolicy {
+  enabled: boolean;
+  max_stopped_count: number;
 }
 
 export interface SystemResources {
@@ -258,6 +267,11 @@ export const api = {
       return request("POST", `/api/instances/${id}/regenerate-token`);
     },
 
+    /** Returns a map of instanceID → disk usage bytes. Cached server-side (1-hour TTL). */
+    diskUsage(): Promise<Record<string, number>> {
+      return request("GET", "/api/instances/disk-usage");
+    },
+
     /** Returns updated instance, null if unchanged (204), or {deleted:true} if removed */
     async pollStatus(
       id: string,
@@ -363,6 +377,14 @@ export const api = {
 
     saveStartupScript(script: string): Promise<void> {
       return request("PUT", "/api/settings/startup-script", { script });
+    },
+
+    saveCORSOrigins(origins: string[]): Promise<void> {
+      return request("PUT", "/api/settings/cors", { origins });
+    },
+
+    saveRecyclingPolicy(policy: RecyclingPolicy): Promise<void> {
+      return request("PUT", "/api/settings/recycling", policy);
     },
   },
 };

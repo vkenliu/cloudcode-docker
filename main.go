@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,19 +77,20 @@ func main() {
 		log.Fatalf("Failed to sub embedded SPA: %v", err)
 	}
 
-	corsOrigins := parseOrigins(*corsOrigin)
+	flagOrigins := parseOrigins(*corsOrigin)
+	if len(flagOrigins) > 0 {
+		log.Printf("CORS enabled for CLI origins: %s", strings.Join(flagOrigins, ", "))
+	}
 
 	rp := proxy.New()
-	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, corsOrigins)
+	h := handler.New(db, dm, rp, cfgMgr, spaFiles, *accessToken, flagOrigins)
 
 	mux := http.NewServeMux()
 
-	// CORS middleware for development
-	var rootHandler http.Handler = mux
-	if len(corsOrigins) > 0 {
-		log.Printf("CORS enabled for origins: %s", strings.Join(corsOrigins, ", "))
-		rootHandler = corsMiddleware(corsOrigins, mux)
-	}
+	// Dynamic CORS middleware — always active so saved origins take effect
+	// without requiring a restart. Checks CLI flag origins (static) plus
+	// config-file origins (re-read on each request).
+	rootHandler := dynamicCORSMiddleware(flagOrigins, cfgMgr, mux)
 
 	h.RegisterRoutes(mux)
 
@@ -139,16 +141,62 @@ func parseOrigins(s string) []string {
 	return out
 }
 
-// corsMiddleware reflects the request Origin back if it is in the allowlist.
-func corsMiddleware(origins []string, next http.Handler) http.Handler {
-	set := make(map[string]struct{}, len(origins))
-	for _, o := range origins {
-		set[strings.ToLower(o)] = struct{}{}
+// dynamicCORSMiddleware checks the request Origin against both the static CLI
+// flag origins and the config-file origins. Config origins are cached for 30s
+// to avoid reading cors.json on every request.
+func dynamicCORSMiddleware(flagOrigins []string, cfgMgr *config.Manager, next http.Handler) http.Handler {
+	// Pre-build a set for the static CLI origins (never changes).
+	flagSet := make(map[string]struct{}, len(flagOrigins))
+	for _, o := range flagOrigins {
+		flagSet[strings.ToLower(o)] = struct{}{}
 	}
+
+	// Cached config origins (re-read every 30s).
+	var (
+		cachedMu      sync.Mutex
+		cachedOrigins []string
+		cachedAt      time.Time
+	)
+	const cacheTTL = 30 * time.Second
+
+	getConfigOrigins := func() []string {
+		cachedMu.Lock()
+		defer cachedMu.Unlock()
+		if time.Since(cachedAt) < cacheTTL {
+			return cachedOrigins
+		}
+		if saved, err := cfgMgr.GetCORSOrigins(); err == nil {
+			cachedOrigins = saved
+		}
+		cachedAt = time.Now()
+		return cachedOrigins
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if _, ok := set[strings.ToLower(origin)]; ok {
+			// Always set Vary: Origin to prevent cache poisoning.
+			w.Header().Add("Vary", "Origin")
+
+			allowed := false
+			lower := strings.ToLower(origin)
+
+			// Check static CLI origins first (fast path).
+			if _, ok := flagSet[lower]; ok {
+				allowed = true
+			}
+
+			// Check saved config origins (cached).
+			if !allowed {
+				for _, s := range getConfigOrigins() {
+					if strings.EqualFold(s, origin) {
+						allowed = true
+						break
+					}
+				}
+			}
+
+			if allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")

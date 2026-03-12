@@ -21,13 +21,24 @@ const (
 	DirOpenCodeData   = "opencode-data" // → /root/.local/share/opencode/
 	DirDotOpenCode    = "dot-opencode"  // → /root/.opencode/
 	DirAgentsSkills   = "agents-skills" // → /root/.agents/
+	DirAditCore       = "adit-core"     // → /root/.adit-core/
 	FileEnvVars       = "env.json"
+	FileCORSOrigins   = "cors.json"
+	FileRecycling     = "recycling.json"
 	FileStartupScript = "startup.sh" // executed by entrypoint on every container start
 )
 
+// RecyclingPolicy defines the auto-cleanup policy for stopped instances.
+type RecyclingPolicy struct {
+	Enabled         bool `json:"enabled"`
+	MaxStoppedCount int  `json:"max_stopped_count"` // 0 = use default (5)
+}
+
+// DefaultMaxStoppedCount is the default number of stopped instances kept.
+const DefaultMaxStoppedCount = 5
+
 var OpenCodeConfigFiles = []string{
 	"opencode.jsonc",
-	"oh-my-opencode.json",
 	"package.json",
 }
 
@@ -68,7 +79,10 @@ type Manager struct {
 }
 
 func NewManager(dataDir string) (*Manager, error) {
-	rootDir := filepath.Join(dataDir, "config")
+	rootDir, err := filepath.Abs(filepath.Join(dataDir, "config"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve config root: %w", err)
+	}
 	m := &Manager{rootDir: rootDir}
 
 	if hostDataDir := os.Getenv("HOST_DATA_DIR"); hostDataDir != "" {
@@ -110,6 +124,7 @@ func (m *Manager) ensureDirs() error {
 		filepath.Join(m.rootDir, DirDotOpenCode),
 		filepath.Join(m.rootDir, DirAgentsSkills),
 		filepath.Join(m.rootDir, DirAgentsSkills, "skills"),
+		filepath.Join(m.rootDir, DirAditCore),
 	}
 	for _, d := range OpenCodeConfigDirs {
 		dirs = append(dirs, filepath.Join(m.rootDir, DirOpenCodeConfig, d))
@@ -229,6 +244,65 @@ func (m *Manager) SetEnvVars(env map[string]string) error {
 	return os.WriteFile(filepath.Join(m.rootDir, FileEnvVars), data, 0600)
 }
 
+// GetCORSOrigins returns the saved CORS origins, or an empty slice if none.
+func (m *Manager) GetCORSOrigins() ([]string, error) {
+	p := filepath.Join(m.rootDir, FileCORSOrigins)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	var origins []string
+	if err := json.Unmarshal(data, &origins); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", FileCORSOrigins, err)
+	}
+	return origins, nil
+}
+
+// SetCORSOrigins writes the CORS origins list to cors.json.
+func (m *Manager) SetCORSOrigins(origins []string) error {
+	data, err := json.MarshalIndent(origins, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(m.rootDir, FileCORSOrigins), data, 0600)
+}
+
+// GetRecyclingPolicy returns the recycling policy, or a disabled default if not configured.
+func (m *Manager) GetRecyclingPolicy() (RecyclingPolicy, error) {
+	p := filepath.Join(m.rootDir, FileRecycling)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return RecyclingPolicy{Enabled: false, MaxStoppedCount: DefaultMaxStoppedCount}, nil
+		}
+		return RecyclingPolicy{}, err
+	}
+	var policy RecyclingPolicy
+	if err := json.Unmarshal(data, &policy); err != nil {
+		return RecyclingPolicy{}, fmt.Errorf("parse %s: %w", FileRecycling, err)
+	}
+	// MaxStoppedCount=0 is valid (keep none); only fix negative values.
+	if policy.MaxStoppedCount < 0 {
+		policy.MaxStoppedCount = DefaultMaxStoppedCount
+	}
+	return policy, nil
+}
+
+// SetRecyclingPolicy writes the recycling policy to recycling.json.
+func (m *Manager) SetRecyclingPolicy(policy RecyclingPolicy) error {
+	if policy.MaxStoppedCount < 0 {
+		policy.MaxStoppedCount = DefaultMaxStoppedCount
+	}
+	data, err := json.MarshalIndent(policy, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(m.rootDir, FileRecycling), data, 0600)
+}
+
 // GetStartupScript returns the contents of startup.sh, or empty string if it doesn't exist.
 func (m *Manager) GetStartupScript() (string, error) {
 	p := filepath.Join(m.rootDir, FileStartupScript)
@@ -309,6 +383,10 @@ func (m *Manager) ContainerMountsForInstance(instanceID string) ([]ContainerMoun
 			HostPath:      filepath.Join(root, DirAgentsSkills),
 			ContainerPath: "/root/.agents",
 		},
+		{
+			HostPath:      filepath.Join(root, DirAditCore),
+			ContainerPath: "/root/.adit-core",
+		},
 	}
 
 	// Mount startup.sh only if it exists and is non-empty.
@@ -338,7 +416,6 @@ type ConfigFileInfo struct {
 func (m *Manager) EditableFiles() []ConfigFileInfo {
 	return []ConfigFileInfo{
 		{Name: "opencode.jsonc", RelPath: filepath.Join(DirOpenCodeConfig, "opencode.jsonc"), Hint: "OpenCode main config (providers, MCP servers, plugins)"},
-		{Name: "oh-my-opencode.json", RelPath: filepath.Join(DirOpenCodeConfig, "oh-my-opencode.json"), Hint: "Oh My OpenCode config (agent/category model assignments)"},
 		{Name: "AGENTS.md", RelPath: filepath.Join(DirOpenCodeConfig, "AGENTS.md"), Hint: "Global rules shared across all instances (~/.config/opencode/AGENTS.md)"},
 		{Name: "auth.json", RelPath: filepath.Join(DirOpenCodeData, "auth.json"), Hint: "API keys and OAuth tokens (Anthropic, OpenAI, etc.)"},
 		{Name: "~/.config/opencode/package.json", RelPath: filepath.Join(DirOpenCodeConfig, "package.json"), Hint: "OpenCode plugin dependencies"},

@@ -21,8 +21,8 @@ ENV NODE_OPTIONS="--max-old-space-size=4096"
 # ── Layer 1: Base system packages (most stable, cached aggressively) ──────────
 # ripgrep (rg)  — required by opencode's built-in search/grep tool
 # fd-find       — fast file discovery (aliased as 'fd' below)
-# fzf           — fuzzy file/history search used by oh-my-opencode shell integration
-# zoxide        — smarter cd replacement used by oh-my-opencode
+# fzf           — fuzzy file/history search for interactive shells
+# zoxide        — smarter cd replacement for interactive shells
 # zsh           — richer interactive shell (Anthropic devcontainer default)
 # gnupg2        — GPG for signed commits and key management
 # iproute2      — provides 'ip' command for network debugging inside containers
@@ -127,19 +127,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# ── Layer 9: OpenCode and ecosystem packages ──────────────────────────────────
-# Install all global bun packages in one layer to minimise image layers:
-#   opencode-ai          — the core AI coding agent (web mode used for CloudCode)
-#   oh-my-opencode       — plugin extending opencode with skills, tools, themes
-#   @fission-ai/openspec — spec-driven development plugin for AI coding assistants
-#
-# oh-my-opencode-linux-arm64 is an optional arm64-specific binary helper;
-# failure is silenced because it only applies on arm64 hosts.
-RUN bun install -g \
-        opencode-ai@latest \
-        oh-my-opencode@latest \
-        @fission-ai/openspec@latest \
-    && bun install -g oh-my-opencode-linux-arm64@latest 2>/dev/null || true
+# ── Layer 9: OpenCode ─────────────────────────────────────────────────────────
+# Install the core AI coding agent (web mode used for CloudCode)
+RUN bun install -g opencode-ai@latest
+
+# ── Layer 9a: adit-core ──────────────────────────────────────────────────────
+# Install adit-core agent framework
+RUN curl -fsSL https://raw.githubusercontent.com/vkenliu/adit-core/main/install.sh | bash
 
 # ── Layer 10: Playwright Chromium ─────────────────────────────────────────────
 # Pre-install Chromium for browser automation skills.
@@ -164,7 +158,8 @@ RUN mkdir -p \
     /root/.opencode \
     /root/.config/opencode \
     /root/.local/share/opencode \
-    /root/.agents/skills
+    /root/.agents/skills \
+    /root/.adit-core
 
 # ── Layer 12: Entrypoint ──────────────────────────────────────────────────────
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

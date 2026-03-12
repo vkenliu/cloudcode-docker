@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"net/netip"
@@ -38,6 +39,11 @@ type Manager struct {
 	mu     sync.Mutex
 	image  string
 	config *config.Manager
+
+	// Volume disk usage cache (1-hour TTL).
+	diskCacheMu sync.Mutex
+	diskCache   map[string]int64 // instanceID → bytes (-1 = unavailable)
+	diskCacheAt time.Time
 }
 
 func NewManager(imageName string, cfgMgr *config.Manager) (*Manager, error) {
@@ -324,10 +330,18 @@ func (m *Manager) RemoveContainerAndVolume(ctx context.Context, containerID, ins
 	}
 	// Always attempt volume removal regardless of container removal outcome.
 	volName := volumePrefix + instanceID
-	_, _ = m.cli.VolumeRemove(ctx, volName, client.VolumeRemoveOptions{Force: true})
-	// Return container error only if it was a real failure (not "not found").
+	_, volErr := m.cli.VolumeRemove(ctx, volName, client.VolumeRemoveOptions{Force: true})
+	if volErr != nil && !strings.Contains(volErr.Error(), "no such volume") {
+		log.Printf("Warning: remove volume %s: %v", volName, volErr)
+	}
+	// Invalidate disk cache since a volume was removed (or attempted).
+	m.InvalidateDiskCache()
+	// Return the first real error encountered.
 	if containerErr != nil && !strings.Contains(containerErr.Error(), "No such container") {
 		return containerErr
+	}
+	if volErr != nil && !strings.Contains(volErr.Error(), "no such volume") {
+		return fmt.Errorf("volume %s removal failed: %w", volName, volErr)
 	}
 	return nil
 }
@@ -409,6 +423,54 @@ func (m *Manager) ExecResize(ctx context.Context, execID string, height, width u
 		Width:  width,
 	})
 	return err
+}
+
+const diskCacheTTL = 1 * time.Hour
+
+// VolumeDiskUsage returns a map of instanceID → disk usage in bytes for all
+// managed CloudCode volumes. Uses a 1-hour cache to avoid expensive Docker
+// system-df calls on every request. Returns -1 for volumes where size is
+// unavailable (non-local driver).
+func (m *Manager) VolumeDiskUsage(ctx context.Context) (map[string]int64, error) {
+	m.diskCacheMu.Lock()
+	defer m.diskCacheMu.Unlock()
+
+	if m.diskCache != nil && time.Since(m.diskCacheAt) < diskCacheTTL {
+		return m.diskCache, nil
+	}
+
+	result, err := m.cli.DiskUsage(ctx, client.DiskUsageOptions{
+		Volumes: true,
+		Verbose: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("docker disk usage: %w", err)
+	}
+
+	usage := make(map[string]int64)
+	// result.Volumes is a value struct; Items is a nil-safe slice.
+	for _, vol := range result.Volumes.Items {
+		if !strings.HasPrefix(vol.Name, volumePrefix) {
+			continue
+		}
+		instID := strings.TrimPrefix(vol.Name, volumePrefix)
+		if vol.UsageData != nil {
+			usage[instID] = vol.UsageData.Size
+		} else {
+			usage[instID] = -1
+		}
+	}
+
+	m.diskCache = usage
+	m.diskCacheAt = time.Now()
+	return usage, nil
+}
+
+// InvalidateDiskCache forces the next VolumeDiskUsage call to re-query Docker.
+func (m *Manager) InvalidateDiskCache() {
+	m.diskCacheMu.Lock()
+	m.diskCache = nil
+	m.diskCacheMu.Unlock()
 }
 
 func (m *Manager) Close() error {

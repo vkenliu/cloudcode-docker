@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Settings, EnvVar, DirFile, AgentsSkill } from "@/lib/api";
+import { api, Settings, EnvVar, DirFile, AgentsSkill, RecyclingPolicy } from "@/lib/api";
 
 // Stable ID for env var rows so React keys don't depend on array index (#34)
 let _uidCounter = 0;
@@ -145,10 +145,13 @@ function EnvVarsEditor({
 function ConfigFileEditor({
   relPath,
   initialContent,
+  lazyLoad,
   agentsSkill,
 }: {
   relPath: string;
   initialContent: string;
+  /** When true, fetches content on mount via readFile (for auth.json etc.) */
+  lazyLoad?: boolean;
   /** When true, saves via the __agents-skill__ dir marker instead of the normal file write path */
   agentsSkill?: boolean;
 }) {
@@ -156,6 +159,7 @@ function ConfigFileEditor({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [loadingContent, setLoadingContent] = useState(false);
   // #33: track whether user has made unsaved edits
   const dirtyRef = useRef(false);
 
@@ -165,6 +169,17 @@ function ConfigFileEditor({
       setContent(initialContent);
     }
   }, [initialContent]);
+
+  // Lazy-load content on mount for files where the settings endpoint returns null.
+  useEffect(() => {
+    if (!lazyLoad) return;
+    setLoadingContent(true);
+    api.settings
+      .readFile(relPath)
+      .then((res) => setContent(res.content))
+      .catch(() => {}) // file may not exist yet
+      .finally(() => setLoadingContent(false));
+  }, [lazyLoad, relPath]);
 
   const save = async () => {
     setBusy(true);
@@ -187,13 +202,19 @@ function ConfigFileEditor({
 
   return (
     <div className="flex flex-col gap-2">
-      <textarea
-        value={content}
-        onChange={(e) => { dirtyRef.current = true; setContent(e.target.value); }}
-        rows={16}
-        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
-        spellCheck={false}
-      />
+      {loadingContent ? (
+        <div className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-500 h-[22rem] flex items-center justify-center">
+          Loading...
+        </div>
+      ) : (
+        <textarea
+          value={content}
+          onChange={(e) => { dirtyRef.current = true; setContent(e.target.value); }}
+          rows={16}
+          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
+          spellCheck={false}
+        />
+      )}
       {error && <div className="text-red-400 text-xs">{error}</div>}
       <div>
         <SaveBtn busy={busy} saved={saved} onClick={save} />
@@ -526,6 +547,190 @@ function AgentsSkillsPanel({
 }
 
 // ============================================================
+// CORS Origins Editor
+// ============================================================
+
+function CORSOriginsEditor({
+  initial,
+  onSaved,
+}: {
+  initial: string[];
+  onSaved: () => void;
+}) {
+  const [origins, setOrigins] = useState<string[]>(initial);
+  const [saving, setSaving] = useState(false);
+  const [saveOk, setSaveOk] = useState(false);
+  const [newOrigin, setNewOrigin] = useState("");
+
+  // Re-sync from parent when settings are reloaded after save.
+  useEffect(() => {
+    setOrigins(initial);
+  }, [initial]);
+
+  const addOrigin = () => {
+    const trimmed = newOrigin.trim();
+    if (
+      trimmed &&
+      !origins.some((o) => o.toLowerCase() === trimmed.toLowerCase())
+    ) {
+      setOrigins([...origins, trimmed]);
+      setNewOrigin("");
+    }
+  };
+
+  const removeOrigin = (index: number) => {
+    setOrigins(origins.filter((_, i) => i !== index));
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.settings.saveCORSOrigins(origins);
+      setSaveOk(true);
+      setTimeout(() => setSaveOk(false), 3000);
+      onSaved();
+    } catch (e) {
+      alert("Failed to save CORS origins: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="space-y-2 mb-4">
+        {origins.map((origin, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <code className="flex-1 bg-slate-900 text-slate-200 px-3 py-2 rounded text-sm font-mono">
+              {origin}
+            </code>
+            <button
+              onClick={() => removeOrigin(i)}
+              className="px-3 py-2 text-xs bg-red-600/20 text-red-400 rounded hover:bg-red-600/40 transition-colors"
+            >
+              Remove
+            </button>
+          </div>
+        ))}
+        {origins.length === 0 && (
+          <div className="text-slate-500 text-sm italic">
+            No CORS origins configured. Only same-origin requests will be
+            allowed.
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-2 mb-4">
+        <input
+          type="text"
+          value={newOrigin}
+          onChange={(e) => setNewOrigin(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && addOrigin()}
+          placeholder="https://example.com"
+          className="flex-1 bg-slate-900 text-white px-3 py-2 rounded text-sm font-mono border border-slate-700 focus:border-blue-500 focus:outline-none"
+        />
+        <button
+          onClick={addOrigin}
+          disabled={!newOrigin.trim()}
+          className="px-4 py-2 text-sm bg-slate-700 text-white rounded hover:bg-slate-600 transition-colors disabled:opacity-40"
+        >
+          Add
+        </button>
+      </div>
+
+      <SaveBtn busy={saving} saved={saveOk} onClick={save} />
+    </div>
+  );
+}
+
+// ============================================================
+// Recycling Policy Editor
+// ============================================================
+
+function RecyclingPolicyEditor({
+  initial,
+  onSaved,
+}: {
+  initial: RecyclingPolicy;
+  onSaved: () => void;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [maxStopped, setMaxStopped] = useState(
+    initial.max_stopped_count ?? 5
+  );
+  const [saving, setSaving] = useState(false);
+  const [saveOk, setSaveOk] = useState(false);
+
+  // Re-sync from parent when settings are reloaded after save.
+  useEffect(() => {
+    setEnabled(initial.enabled);
+    setMaxStopped(initial.max_stopped_count ?? 5);
+  }, [initial]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.settings.saveRecyclingPolicy({
+        enabled,
+        max_stopped_count: maxStopped,
+      });
+      setSaveOk(true);
+      setTimeout(() => setSaveOk(false), 3000);
+      onSaved();
+    } catch (e) {
+      alert("Failed to save recycling policy: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-4">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="w-4 h-4 rounded border-slate-600 bg-slate-900 text-blue-600 focus:ring-blue-500"
+          />
+          <span className="text-sm text-slate-200">
+            Enable recycling policy
+          </span>
+        </label>
+      </div>
+
+      <div className="flex items-center gap-3 mb-4">
+        <label className="text-sm text-slate-400">
+          Max stopped instances to keep:
+        </label>
+        <input
+          type="number"
+          min={0}
+          max={100}
+          value={maxStopped}
+          onChange={(e) =>
+            setMaxStopped(Math.max(0, parseInt(e.target.value) || 0))
+          }
+          disabled={!enabled}
+          className="w-20 bg-slate-900 text-white px-3 py-2 rounded text-sm font-mono border border-slate-700 focus:border-blue-500 focus:outline-none disabled:opacity-40"
+        />
+      </div>
+
+      {enabled && (
+        <div className="text-xs text-slate-500 mb-4">
+          {maxStopped === 0
+            ? "All inactive instances will be immediately removed when they stop (container + volume deleted)."
+            : `When a container stops, if there are more than ${maxStopped} inactive instance${maxStopped === 1 ? "" : "s"}, the oldest will be automatically removed (container + volume deleted).`}
+        </div>
+      )}
+
+      <SaveBtn busy={saving} saved={saveOk} onClick={save} />
+    </div>
+  );
+}
+
+// ============================================================
 // Settings page
 // ============================================================
 
@@ -538,6 +743,8 @@ type TabKey =
   | "skills"
   | "plugins"
   | "agents-skills"
+  | "cors"
+  | "recycling"
   | "directory-mappings";
 
 export default function SettingsPage() {
@@ -573,6 +780,8 @@ export default function SettingsPage() {
     { key: "skills", label: "Skills" },
     { key: "plugins", label: "Plugins" },
     { key: "agents-skills", label: "Agents Skills" },
+    { key: "cors", label: "CORS" },
+    { key: "recycling", label: "Recycling" },
     { key: "directory-mappings", label: "Dir Mappings" },
   ];
 
@@ -682,6 +891,7 @@ export default function SettingsPage() {
                     key={cf.rel_path}
                     relPath={cf.rel_path}
                     initialContent={cf.content ?? ""}
+                    lazyLoad={cf.content === null}
                   />
                 </div>
               );
@@ -711,6 +921,40 @@ export default function SettingsPage() {
             skills={settings.agents_skills}
             onChanged={loadSettings}
           />
+        )}
+
+        {/* --- CORS Origins --- */}
+        {activeTab === "cors" && (
+          <div>
+            <div className="text-sm text-slate-400 mb-4">
+              Origins allowed to make cross-origin requests to the CloudCode
+              API. Changes take effect immediately without a server restart.
+            </div>
+            <CORSOriginsEditor
+              initial={settings.cors_origins ?? []}
+              onSaved={loadSettings}
+            />
+          </div>
+        )}
+
+        {/* --- Recycling Policy --- */}
+        {activeTab === "recycling" && (
+          <div>
+            <div className="text-sm text-slate-400 mb-4">
+              Automatically remove the oldest stopped instances when the count
+              exceeds the configured limit. Removed instances lose their
+              container and volume data permanently.
+            </div>
+            <RecyclingPolicyEditor
+              initial={
+                settings.recycling_policy ?? {
+                  enabled: false,
+                  max_stopped_count: 5,
+                }
+              }
+              onSaved={loadSettings}
+            />
+          </div>
         )}
 
         {/* --- Directory Mappings --- */}

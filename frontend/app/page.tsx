@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import { api, instanceOpenUrl, Instance } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
-import { statusColor, statusLabel } from "@/lib/utils";
+import { statusColor, statusLabel, formatBytes } from "@/lib/utils";
 
 // ---- Log modal -------------------------------------------------------------
 
@@ -45,10 +45,12 @@ function LogModal({
 
 function InstanceCard({
   instance,
+  diskUsageBytes,
   onDeleted,
   onUpdated,
 }: {
   instance: Instance;
+  diskUsageBytes?: number;
   onDeleted: (id: string) => void;
   onUpdated: (inst: Instance) => void;
 }) {
@@ -142,6 +144,12 @@ function InstanceCard({
               ? "unlimited"
               : `${instance.cpu_cores} cores`}
           </span>
+          <span>
+            Disk:{" "}
+            {diskUsageBytes !== undefined
+              ? formatBytes(diskUsageBytes)
+              : "..."}
+          </span>
         </div>
 
         {error && (
@@ -215,6 +223,7 @@ export default function DashboardPage() {
   const [instances, setInstances] = useState<Instance[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [diskUsage, setDiskUsage] = useState<Record<string, number>>({});
 
   const loadInstances = useCallback(async () => {
     try {
@@ -231,6 +240,19 @@ export default function DashboardPage() {
   useEffect(() => {
     loadInstances();
   }, [loadInstances]);
+
+  // Fetch disk usage when instance count changes (creation/deletion).
+  // Server caches for 1 hour so repeated calls are cheap.
+  const prevCountRef = useRef(-1);
+  useEffect(() => {
+    if (loading) return;
+    if (prevCountRef.current === instances.length) return;
+    prevCountRef.current = instances.length;
+    api.instances
+      .diskUsage()
+      .then(setDiskUsage)
+      .catch((e) => console.warn("Failed to fetch disk usage:", e));
+  }, [instances.length, loading]);
 
   // Single batch poller for all instances — one request every 10 s instead of
   // one per card. instancesRef keeps a stable reference so the poll closure
@@ -337,6 +359,7 @@ export default function DashboardPage() {
             <InstanceCard
               key={inst.id}
               instance={inst}
+              diskUsageBytes={diskUsage[inst.id]}
               onDeleted={handleDeleted}
               onUpdated={handleUpdated}
             />

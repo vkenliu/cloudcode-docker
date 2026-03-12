@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, instanceOpenUrl, Instance } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
-import { statusColor } from "@/lib/utils";
+import { statusColor, formatBytes } from "@/lib/utils";
 
 function Field({ label, value }: { label: string; value: string }) {
   return (
@@ -315,7 +315,11 @@ export default function InstanceDetailPage() {
           router.push("/");
           return;
         } else {
-          setInstance(result);
+          // Preserve disk_usage_bytes from prior fetch since poll doesn't include it.
+          setInstance((prev) => ({
+            ...result,
+            disk_usage_bytes: result.disk_usage_bytes ?? prev?.disk_usage_bytes,
+          }));
         }
       } catch {
         // ignore
@@ -333,7 +337,11 @@ export default function InstanceDetailPage() {
     setActionError("");
     try {
       const updated = await api.instances[action](id);
-      setInstance(updated);
+      // Preserve disk_usage_bytes since action responses don't include it.
+      setInstance((prev) => ({
+        ...updated,
+        disk_usage_bytes: updated.disk_usage_bytes ?? prev?.disk_usage_bytes,
+      }));
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -489,6 +497,14 @@ export default function InstanceDetailPage() {
             instance.cpu_cores === 0
               ? "unlimited"
               : `${instance.cpu_cores} cores`
+          }
+        />
+        <Field
+          label="Disk Usage"
+          value={
+            instance.disk_usage_bytes !== undefined
+              ? formatBytes(instance.disk_usage_bytes)
+              : "..."
           }
         />
         <Field
