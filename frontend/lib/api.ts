@@ -85,15 +85,41 @@ export interface ApiError {
 // Base fetch helper
 // ============================================================
 
-const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+// NEXT_PUBLIC_API_BASE: explicit backend URL for all browser requests.
+// When set (e.g. "http://localhost:8080"), all API/WS/instance requests go
+// directly to this URL. When empty, we derive it at runtime from the
+// browser hostname + NEXT_PUBLIC_BACKEND_PORT (default 8080).
+//
+// In Docker mode the frontend (port 3000) and backend (port 8080) run on the
+// same host. The browser talks directly to the backend — no Next.js proxying.
+const EXPLICIT_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+const BACKEND_PORT = process.env.NEXT_PUBLIC_BACKEND_PORT ?? "8080";
 
-// Direct URL to the Go backend for the instance proxy.
-// The instance proxy requires the session cookie to reach Go directly —
-// Next.js dev-server rewrites strip cookies, so we bypass the proxy entirely.
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? BASE;
+/**
+ * Return the public backend URL usable by the browser.
+ * All browser requests (API, WebSocket, instance proxy) go directly to the
+ * Go backend. The frontend only serves the dashboard UI.
+ */
+function backendUrl(): string {
+  if (EXPLICIT_BASE) return EXPLICIT_BASE;
+  if (typeof window !== "undefined") {
+    const port = window.location.port;
+    // If the frontend is served from the backend port (same-origin), use "".
+    if (port === BACKEND_PORT) return "";
+    return `${window.location.protocol}//${window.location.hostname}:${BACKEND_PORT}`;
+  }
+  return "";
+}
+
+// Lazily cached backend URL (computed once on first use in the browser).
+let _cachedBackendUrl: string | undefined;
+function BASE(): string {
+  if (_cachedBackendUrl === undefined) _cachedBackendUrl = backendUrl();
+  return _cachedBackendUrl;
+}
 
 export function instanceProxyUrl(id: string): string {
-  return `${BACKEND_URL}/instance/${id}/`;
+  return `${BASE()}/instance/${id}/`;
 }
 
 /**
@@ -102,7 +128,7 @@ export function instanceProxyUrl(id: string): string {
  * proxy can validate it and set the token cookie for subsequent requests.
  */
 export function instanceOpenUrl(id: string, accessToken: string): string {
-  const base = `${BACKEND_URL}/instance/${id}/`;
+  const base = `${BASE()}/instance/${id}/`;
   if (!accessToken) return base;
   return `${base}?token=${encodeURIComponent(accessToken)}`;
 }
@@ -111,13 +137,14 @@ export function wsBase(): string {
   // Explicit WS base takes priority (set in dev when Next.js can't proxy WS upgrades).
   const wsEnv = process.env.NEXT_PUBLIC_WS_BASE;
   if (wsEnv) return wsEnv;
-  // If an HTTP API base is configured, derive the WS base from it.
-  if (BASE) return BASE.replace(/^http/, "ws");
-  // Same-origin: derive from current page URL at runtime.
+  // Derive WS URL from the backend HTTP URL.
+  const b = BASE();
+  if (b) return b.replace(/^http/, "ws");
+  // Same-origin fallback.
   if (typeof window !== "undefined") {
     return `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
   }
-  return ""; // SSR context — WS is never actually used server-side
+  return "";
 }
 
 /**
@@ -163,7 +190,7 @@ async function request<T>(
   path: string,
   body?: unknown
 ): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${BASE()}${path}`, {
     method,
     credentials: "include", // always send session cookie
     headers: body ? { "Content-Type": "application/json" } : {},

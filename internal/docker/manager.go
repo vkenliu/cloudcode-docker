@@ -248,8 +248,33 @@ func (m *Manager) GetContainerIPAndPort(ctx context.Context, containerID string)
 		return "", 0, fmt.Errorf("inspect container: %w", err)
 	}
 
-	// M6: look specifically for the binding on containerPort/tcp rather than
-	// returning the first arbitrary binding (map iteration is non-deterministic).
+	// Prefer the container's IP on cloudcode-net so the proxy can reach
+	// the instance directly over the Docker bridge network. This works
+	// regardless of whether the platform itself runs on the host or inside
+	// a container (where 127.0.0.1 published ports are unreachable).
+	ip := ""
+	if ep, ok := result.Container.NetworkSettings.Networks[networkName]; ok && ep.IPAddress.IsValid() {
+		ip = ep.IPAddress.String()
+	}
+
+	if ip != "" {
+		// Read OPENCODE_PORT from container env.
+		port := containerPort
+		for _, env := range result.Container.Config.Env {
+			if strings.HasPrefix(env, "OPENCODE_PORT=") {
+				var p int
+				if n, _ := fmt.Sscanf(env[len("OPENCODE_PORT="):], "%d", &p); n == 1 && p > 0 {
+					port = p
+				}
+				break
+			}
+		}
+		return ip, port, nil
+	}
+
+	// Fallback for legacy containers without cloudcode-net: use the
+	// published host port on 127.0.0.1 (only works when the platform
+	// runs directly on the host, not inside a container).
 	targetPort := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
 	if bindings, ok := result.Container.NetworkSettings.Ports[targetPort]; ok {
 		for _, b := range bindings {
@@ -262,28 +287,7 @@ func (m *Manager) GetContainerIPAndPort(ctx context.Context, containerID string)
 		}
 	}
 
-	// New containers: connect via Docker network IP + OPENCODE_PORT.
-	ip := ""
-	if ep, ok := result.Container.NetworkSettings.Networks[networkName]; ok && ep.IPAddress.IsValid() {
-		ip = ep.IPAddress.String()
-	}
-	if ip == "" {
-		return "", 0, fmt.Errorf("container %s has no IP on network %s", containerID, networkName)
-	}
-
-	// Read OPENCODE_PORT from container env.
-	port := containerPort
-	for _, env := range result.Container.Config.Env {
-		if strings.HasPrefix(env, "OPENCODE_PORT=") {
-			var p int
-			if n, _ := fmt.Sscanf(env[len("OPENCODE_PORT="):], "%d", &p); n == 1 && p > 0 {
-				port = p
-			}
-			break
-		}
-	}
-
-	return ip, port, nil
+	return "", 0, fmt.Errorf("container %s has no IP on network %s and no published port", containerID, networkName)
 }
 
 // GetContainerIP returns the container's IP address on the cloudcode-net network.

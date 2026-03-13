@@ -8,24 +8,27 @@
 #   bash install.sh [OPTIONS]
 #
 # Options:
-#   --token <TOKEN>       Platform access token (default: auto-generated)
-#   --port <PORT>         Host port for the web UI (default: 8080)
-#   --data-dir <PATH>     Data directory (default: /opt/cloudcode/data)
-#   --install-dir <PATH>  Install directory (default: /opt/cloudcode)
-#   --skip-base-image     Skip building the base image (pull from GHCR instead)
-#   --china               Use Chinese mirrors for Docker, Go, Node, etc.
-#   --help                Show this help
+#   --token <TOKEN>         Platform access token (default: auto-generated)
+#   --backend-port <PORT>   Host port for the Go backend (default: 8080)
+#   --frontend-port <PORT>  Host port for the Next.js frontend (default: 3000)
+#   --data-dir <PATH>       Data directory (default: /opt/cloudcode/data)
+#   --install-dir <PATH>    Install directory (default: /opt/cloudcode)
+#   --skip-base-image       Skip building the base image
+#   --china                 Use Chinese mirrors for Docker, Go, Node, etc.
+#   --help                  Show this help
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/cloudcode"
 DATA_DIR=""  # set later if not overridden
-PORT=8080
+BACKEND_PORT=8080
+FRONTEND_PORT=3000
 ACCESS_TOKEN=""
 SKIP_BASE_IMAGE=false
 CHINA_MIRROR=false
 PLATFORM_IMAGE="cloudcode:latest"
+FRONTEND_IMAGE="cloudcode-frontend:latest"
 BASE_IMAGE="cloudcode-base:latest"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -43,12 +46,14 @@ info() { echo -e "${BLUE}[CloudCode]${NC} $*"; }
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --token)        ACCESS_TOKEN="$2"; shift 2 ;;
-        --port)         PORT="$2"; shift 2 ;;
-        --data-dir)     DATA_DIR="$2"; shift 2 ;;
-        --install-dir)  INSTALL_DIR="$2"; shift 2 ;;
+        --token)          ACCESS_TOKEN="$2"; shift 2 ;;
+        --backend-port)   BACKEND_PORT="$2"; shift 2 ;;
+        --frontend-port)  FRONTEND_PORT="$2"; shift 2 ;;
+        --port)           BACKEND_PORT="$2"; shift 2 ;;  # backward compat
+        --data-dir)       DATA_DIR="$2"; shift 2 ;;
+        --install-dir)    INSTALL_DIR="$2"; shift 2 ;;
         --skip-base-image) SKIP_BASE_IMAGE=true; shift ;;
-        --china)        CHINA_MIRROR=true; shift ;;
+        --china)          CHINA_MIRROR=true; shift ;;
         --help)
             sed -n '2,/^# ──/p' "$0" | head -n -1 | sed 's/^# \?//'
             exit 0
@@ -68,10 +73,11 @@ fi
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 log "Starting CloudCode installation..."
-info "Install dir : ${INSTALL_DIR}"
-info "Data dir    : ${DATA_DIR}"
-info "Port        : ${PORT}"
-info "China mirror: ${CHINA_MIRROR}"
+info "Install dir    : ${INSTALL_DIR}"
+info "Data dir       : ${DATA_DIR}"
+info "Backend port   : ${BACKEND_PORT}"
+info "Frontend port  : ${FRONTEND_PORT}"
+info "China mirror   : ${CHINA_MIRROR}"
 echo ""
 
 check_root() {
@@ -204,10 +210,8 @@ create_directories() {
 # ── Step 5: Build or pull the base image ──────────────────────────────────────
 setup_base_image() {
     if [[ "$SKIP_BASE_IMAGE" == true ]]; then
-        log "Pulling base image from GHCR..."
         err "No pre-built base image available. Please remove --skip-base-image to build from source."
         exit 1
-        return 0
     fi
 
     log "Building base image (this may take 10-30 minutes)..."
@@ -376,7 +380,7 @@ ENTRYPOINT
     docker build -t cloudcode-base:latest -f "${INSTALL_DIR}/docker/Dockerfile" "${INSTALL_DIR}/docker/"
 }
 
-# ── Step 6: Pull or build the platform image ──────────────────────────────────
+# ── Step 6: Build the platform image ──────────────────────────────────────────
 setup_platform_image() {
     if docker image inspect "${PLATFORM_IMAGE}" &>/dev/null; then
         log "Platform image already exists: ${PLATFORM_IMAGE}"
@@ -395,7 +399,28 @@ setup_platform_image() {
     log "Platform image built: cloudcode:latest"
 }
 
-# ── Step 7: Write docker-compose.yml ──────────────────────────────────────────
+# ── Step 7: Build the frontend image ─────────────────────────────────────────
+setup_frontend_image() {
+    if docker image inspect "${FRONTEND_IMAGE}" &>/dev/null; then
+        log "Frontend image already exists: ${FRONTEND_IMAGE}"
+        return 0
+    fi
+
+    log "Building frontend image..."
+
+    if [[ ! -f "${INSTALL_DIR}/frontend/Dockerfile" ]]; then
+        err "frontend/Dockerfile not found in ${INSTALL_DIR}."
+        err "Please place the project source code in ${INSTALL_DIR}."
+        exit 1
+    fi
+
+    docker build -t cloudcode-frontend:latest \
+        -f "${INSTALL_DIR}/frontend/Dockerfile" \
+        "${INSTALL_DIR}/frontend/"
+    log "Frontend image built: cloudcode-frontend:latest"
+}
+
+# ── Step 8: Write docker-compose.yml ──────────────────────────────────────────
 write_compose() {
     log "Writing docker-compose.yml..."
 
@@ -405,7 +430,7 @@ services:
     image: ${PLATFORM_IMAGE}
     container_name: cloudcode
     ports:
-      - "${PORT}:8080"
+      - "${BACKEND_PORT}:8080"
     environment:
       - HOST_DATA_DIR=${DATA_DIR}
     volumes:
@@ -415,15 +440,23 @@ services:
       - cloudcode-net
     restart: unless-stopped
     command:
-      - /app/cloudcode
-      - -addr
-      - ":8080"
-      - -data
-      - /app/data
       - -access-token
       - "${ACCESS_TOKEN}"
+      - -cors-origin
+      - "http://localhost:${FRONTEND_PORT}"
       - -image
       - "${BASE_IMAGE}"
+
+  frontend:
+    image: ${FRONTEND_IMAGE}
+    container_name: cloudcode-frontend
+    ports:
+      - "${FRONTEND_PORT}:3000"
+    networks:
+      - cloudcode-net
+    restart: unless-stopped
+    depends_on:
+      - cloudcode
 
 networks:
   cloudcode-net:
@@ -432,7 +465,7 @@ networks:
 COMPOSE
 }
 
-# ── Step 8: Start the service ─────────────────────────────────────────────────
+# ── Step 9: Start the service ─────────────────────────────────────────────────
 start_service() {
     log "Starting CloudCode..."
     cd "${INSTALL_DIR}"
@@ -452,7 +485,7 @@ start_service() {
     fi
 }
 
-# ── Step 9: Print summary ────────────────────────────────────────────────────
+# ── Step 10: Print summary ───────────────────────────────────────────────────
 print_summary() {
     local host_ip
     host_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_SERVER_IP")
@@ -461,19 +494,20 @@ print_summary() {
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║            CloudCode Installation Complete!                 ║${NC}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  Web UI:       http://${host_ip}:${PORT}                      "
-    echo -e "${GREEN}║${NC}  Access Token: ${ACCESS_TOKEN}                                "
-    echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  Install Dir:  ${INSTALL_DIR}                                 "
-    echo -e "${GREEN}║${NC}  Data Dir:     ${DATA_DIR}                                    "
-    echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}                                                              "
+    echo -e "${GREEN}║${NC}  Frontend:      http://${host_ip}:${FRONTEND_PORT}            "
+    echo -e "${GREEN}║${NC}  Backend API:   http://${host_ip}:${BACKEND_PORT}             "
+    echo -e "${GREEN}║${NC}  Access Token:  ${ACCESS_TOKEN}                               "
+    echo -e "${GREEN}║${NC}                                                              "
+    echo -e "${GREEN}║${NC}  Install Dir:   ${INSTALL_DIR}                                "
+    echo -e "${GREEN}║${NC}  Data Dir:      ${DATA_DIR}                                   "
+    echo -e "${GREEN}║${NC}                                                              "
     echo -e "${GREEN}║${NC}  Manage:                                                     "
     echo -e "${GREEN}║${NC}    cd ${INSTALL_DIR}                                          "
     echo -e "${GREEN}║${NC}    docker compose logs -f      # view logs                   "
     echo -e "${GREEN}║${NC}    docker compose restart       # restart                    "
     echo -e "${GREEN}║${NC}    docker compose down          # stop                       "
-    echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}                                                              "
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -489,6 +523,7 @@ main() {
     create_directories
     setup_base_image
     setup_platform_image
+    setup_frontend_image
     write_compose
     start_service
     print_summary
