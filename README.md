@@ -35,7 +35,7 @@ docker compose up -d
 
 Open http://localhost:8080 in your browser and log in with the token configured via `--access-token`.
 
-Images are pulled from `ghcr.io/naiba/cloudcode` and `ghcr.io/naiba/cloudcode-base` automatically.
+The platform uses locally built images `cloudcode:latest` and `cloudcode-base:latest`. See `install.sh` for automated setup.
 
 ## Authentication
 

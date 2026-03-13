@@ -1,6 +1,6 @@
 services:
   cloudcode:
-    image: ghcr.io/naiba/cloudcode:latest
+    image: cloudcode:latest
     ports:
       - "8080:8080"
     environment:
