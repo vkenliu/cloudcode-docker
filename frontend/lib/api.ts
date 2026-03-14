@@ -305,7 +305,7 @@ export const api = {
       currentStatus: string
     ): Promise<Instance | { deleted: true } | null> {
       const res = await fetch(
-        `${BASE}/api/instances/${id}/status?s=${encodeURIComponent(currentStatus)}`,
+        `${BASE()}/api/instances/${id}/status?s=${encodeURIComponent(currentStatus)}`,
         { credentials: "include" }
       );
       if (res.status === 204) return null;

@@ -420,6 +420,23 @@ setup_frontend_image() {
     log "Frontend image built: cloudcode-frontend:latest"
 }
 
+# ── Step 7b: Build CORS origins ───────────────────────────────────────────────
+build_cors_origins() {
+    local origins="http://localhost:${FRONTEND_PORT}"
+
+    # Add all non-loopback IPs (public and private)
+    local ips
+    ips=$(hostname -I 2>/dev/null || true)
+    for ip in $ips; do
+        # Skip loopback
+        [[ "$ip" == 127.* ]] && continue
+        origins="${origins},http://${ip}:${FRONTEND_PORT}"
+    done
+
+    CORS_ORIGINS="$origins"
+    info "CORS origins: ${CORS_ORIGINS}"
+}
+
 # ── Step 8: Write docker-compose.yml ──────────────────────────────────────────
 write_compose() {
     log "Writing docker-compose.yml..."
@@ -443,7 +460,7 @@ services:
       - -access-token
       - "${ACCESS_TOKEN}"
       - -cors-origin
-      - "http://localhost:${FRONTEND_PORT}"
+      - "${CORS_ORIGINS}"
       - -image
       - "${BASE_IMAGE}"
 
@@ -524,6 +541,7 @@ main() {
     setup_base_image
     setup_platform_image
     setup_frontend_image
+    build_cors_origins
     write_compose
     start_service
     print_summary
