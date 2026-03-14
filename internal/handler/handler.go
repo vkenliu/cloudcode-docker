@@ -3,10 +3,13 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -61,6 +64,7 @@ type Handler struct {
 	sessions      sync.Map      // sessionID (string) → sessionEntry
 	wsTokens      sync.Map      // one-time WS token (string) → wsTokenEntry
 	loginAttempts sync.Map      // IP (string) → *loginState
+	oauthVerifier sync.Map      // flowID (string) → pkceVerifier (string)
 	done          chan struct{} // closed on shutdown to stop background goroutines
 }
 
@@ -222,6 +226,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/system/setup-status", h.auth(http.HandlerFunc(h.apiSetupStatus)))
 	mux.Handle("POST /api/system/setup", h.auth(http.HandlerFunc(h.apiSetup)))
 	mux.Handle("POST /api/system/reset", h.auth(http.HandlerFunc(h.apiSystemReset)))
+	mux.Handle("POST /api/auth/anthropic/authorize", h.auth(http.HandlerFunc(h.apiAnthropicAuthorize)))
+	mux.Handle("POST /api/auth/anthropic/callback", h.auth(http.HandlerFunc(h.apiAnthropicCallback)))
 
 	// --- Settings API (protected) ---
 	mux.Handle("GET /api/settings", h.auth(http.HandlerFunc(h.apiGetSettings)))
@@ -1257,6 +1263,160 @@ func (h *Handler) apiSystemReset(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("System reset complete. Setup wizard will appear on next page load.")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset_complete"})
+}
+
+// ---- Anthropic OAuth Connect ----
+
+const (
+	anthropicClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	anthropicRedirectURI = "https://console.anthropic.com/oauth/code/callback"
+	anthropicTokenURL    = "https://console.anthropic.com/v1/oauth/token"
+	anthropicScope       = "org:create_api_key user:profile user:inference"
+)
+
+// generatePKCE creates a random verifier and its S256 challenge.
+func generatePKCE() (verifier, challenge string) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(b)
+	h := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(h[:])
+	return
+}
+
+func (h *Handler) apiAnthropicAuthorize(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Mode string `json:"mode"` // "max" (Claude Pro/Max) or "console" (API key via console)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Mode = "max"
+	}
+
+	verifier, challenge := generatePKCE()
+
+	// Build authorize URL
+	var baseURL string
+	if req.Mode == "console" {
+		baseURL = "https://console.anthropic.com/oauth/authorize"
+	} else {
+		baseURL = "https://claude.ai/oauth/authorize"
+	}
+
+	u, _ := url.Parse(baseURL)
+	q := u.Query()
+	q.Set("code", "true")
+	q.Set("client_id", anthropicClientID)
+	q.Set("response_type", "code")
+	q.Set("redirect_uri", anthropicRedirectURI)
+	q.Set("scope", anthropicScope)
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", verifier)
+	u.RawQuery = q.Encode()
+
+	// Store verifier keyed by a flow ID
+	flowID := uuid.New().String()
+	h.oauthVerifier.Store(flowID, verifier)
+
+	// Auto-expire after 10 minutes
+	go func() {
+		time.Sleep(10 * time.Minute)
+		h.oauthVerifier.Delete(flowID)
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"url":     u.String(),
+		"flow_id": flowID,
+	})
+}
+
+func (h *Handler) apiAnthropicCallback(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		FlowID string `json:"flow_id"`
+		Code   string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Retrieve and delete the verifier
+	v, ok := h.oauthVerifier.LoadAndDelete(req.FlowID)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid or expired flow_id")
+		return
+	}
+	verifier := v.(string)
+
+	// The pasted code may be in format "code#state"
+	code := req.Code
+	state := ""
+	if parts := strings.SplitN(code, "#", 2); len(parts) == 2 {
+		code = parts[0]
+		state = parts[1]
+	}
+
+	// Exchange code for tokens
+	body, _ := json.Marshal(map[string]string{
+		"code":          code,
+		"state":         state,
+		"grant_type":    "authorization_code",
+		"client_id":     anthropicClientID,
+		"redirect_uri":  anthropicRedirectURI,
+		"code_verifier": verifier,
+	})
+
+	resp, err := http.Post(anthropicTokenURL, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to contact Anthropic token endpoint: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		writeError(w, http.StatusBadGateway, "Anthropic token exchange failed: "+string(respBody))
+		return
+	}
+
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+		writeError(w, http.StatusBadGateway, "invalid token response from Anthropic")
+		return
+	}
+
+	// Write to auth.json in opencode format
+	authEntry := map[string]interface{}{
+		"type":    "oauth",
+		"access":  tokenResp.AccessToken,
+		"refresh": tokenResp.RefreshToken,
+		"expires": time.Now().UnixMilli() + tokenResp.ExpiresIn*1000,
+	}
+	authJSON, _ := json.Marshal(authEntry)
+
+	// Merge into existing auth.json
+	existingRaw, _ := h.config.ReadFile("opencode-data/auth.json")
+	merged := make(map[string]json.RawMessage)
+	if existingRaw != "" {
+		_ = json.Unmarshal([]byte(existingRaw), &merged)
+	}
+	merged["anthropic"] = authJSON
+	data, _ := json.MarshalIndent(merged, "", "  ")
+	if err := h.config.WriteFile("opencode-data/auth.json", string(data)); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save auth.json: "+err.Error())
+		return
+	}
+
+	log.Println("Anthropic OAuth tokens saved to auth.json")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "connected"})
 }
 
 // apiDiskUsage returns a map of instanceID → disk usage bytes for all instances.

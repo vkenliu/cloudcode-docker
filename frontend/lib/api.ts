@@ -361,6 +361,24 @@ export const api = {
       return request("GET", "/api/system/setup-status");
     },
 
+    /** Start Anthropic OAuth flow — returns authorize URL and flow_id. */
+    anthropicAuthorize(
+      mode: "max" | "console"
+    ): Promise<{ url: string; flow_id: string }> {
+      return request("POST", "/api/auth/anthropic/authorize", { mode });
+    },
+
+    /** Complete Anthropic OAuth flow — exchange code for tokens. */
+    anthropicCallback(
+      flowId: string,
+      code: string
+    ): Promise<{ status: string }> {
+      return request("POST", "/api/auth/anthropic/callback", {
+        flow_id: flowId,
+        code,
+      });
+    },
+
     /** Save first-time setup configuration. */
     setup(payload: {
       cors_origins?: string[];

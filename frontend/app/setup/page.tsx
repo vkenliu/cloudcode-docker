@@ -32,6 +32,14 @@ export default function SetupPage() {
   const [openaiKey, setOpenaiKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
 
+  // Anthropic OAuth connect
+  const [oauthUrl, setOauthUrl] = useState("");
+  const [oauthFlowId, setOauthFlowId] = useState("");
+  const [oauthCode, setOauthCode] = useState("");
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthConnected, setOauthConnected] = useState(false);
+  const [oauthError, setOauthError] = useState("");
+
   // Platform settings
   const [corsOrigins, setCorsOrigins] = useState("");
   const [recyclingEnabled, setRecyclingEnabled] = useState(true);
@@ -67,18 +75,14 @@ export default function SetupPage() {
     setSaving(true);
     setError("");
     try {
-      // Build env vars
+      // Build env vars — only tokens, NOT API keys (those go to auth.json)
       const envVars: Record<string, string> = {};
       if (githubToken.trim()) {
         envVars["GITHUB_TOKEN"] = githubToken.trim();
-        envVars["GH_TOKEN"] = githubToken.trim();
       }
-      if (aditAuthToken.trim())
+      if (aditAuthToken.trim()) {
         envVars["ADIT_AUTH_TOKEN"] = aditAuthToken.trim();
-      if (anthropicKey.trim())
-        envVars["ANTHROPIC_API_KEY"] = anthropicKey.trim();
-      if (openaiKey.trim()) envVars["OPENAI_API_KEY"] = openaiKey.trim();
-      if (geminiKey.trim()) envVars["GEMINI_API_KEY"] = geminiKey.trim();
+      }
 
       // Build CORS origins
       const origins = corsOrigins
@@ -95,13 +99,13 @@ export default function SetupPage() {
       // Build auth.json for AI providers (opencode format)
       const authJson: Record<string, unknown> = {};
       if (anthropicKey.trim()) {
-        authJson["anthropic"] = { apiKey: anthropicKey.trim() };
+        authJson["anthropic"] = { type: "api", key: anthropicKey.trim() };
       }
       if (openaiKey.trim()) {
-        authJson["openai"] = { apiKey: openaiKey.trim() };
+        authJson["openai"] = { type: "api", key: openaiKey.trim() };
       }
       if (geminiKey.trim()) {
-        authJson["google"] = { apiKey: geminiKey.trim() };
+        authJson["google"] = { type: "api", key: geminiKey.trim() };
       }
 
       await api.system.setup({
@@ -220,29 +224,183 @@ export default function SetupPage() {
           <div className="flex flex-col gap-6">
             <div>
               <h2 className="text-lg font-semibold text-white mb-1">
-                AI Model API Keys
+                AI Model Keys
               </h2>
               <p className="text-sm text-slate-400">
-                API keys for the AI model providers. These are set as
-                environment variables (ANTHROPIC_API_KEY, etc.) and written to
-                auth.json for OpenCode.
+                Connect your Anthropic account via OAuth, or enter API keys
+                manually. Keys are saved to auth.json (shared across all
+                instances).
               </p>
             </div>
 
-            <div className="flex flex-col gap-1.5">
-              <label className="text-sm font-medium text-slate-300">
-                Anthropic API Key
-              </label>
-              <p className="text-xs text-slate-500">
-                For Claude models (Claude 4 Sonnet, Claude 4 Opus, etc.)
-              </p>
-              <input
-                type="password"
-                placeholder="sk-ant-xxxxxxxxxxxx"
-                value={anthropicKey}
-                onChange={(e) => setAnthropicKey(e.target.value)}
-                className={inputClass}
-              />
+            {/* Anthropic OAuth Connect */}
+            <div className="flex flex-col gap-3 p-4 bg-slate-900/60 border border-slate-700 rounded-lg">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-sm font-medium text-slate-300">
+                    Anthropic (Claude)
+                  </label>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Connect your Claude Pro or Max subscription, or enter an
+                    API key manually.
+                  </p>
+                </div>
+                {oauthConnected && (
+                  <span className="text-xs font-medium text-green-400 bg-green-950/50 border border-green-800 px-2 py-1 rounded">
+                    Connected
+                  </span>
+                )}
+              </div>
+
+              {/* OAuth flow states */}
+              {!oauthUrl && !oauthConnected && (
+                <div className="flex gap-2">
+                  <button
+                    onClick={async () => {
+                      setOauthBusy(true);
+                      setOauthError("");
+                      try {
+                        const res =
+                          await api.system.anthropicAuthorize("max");
+                        setOauthUrl(res.url);
+                        setOauthFlowId(res.flow_id);
+                      } catch (e) {
+                        setOauthError(
+                          e instanceof Error ? e.message : String(e)
+                        );
+                      } finally {
+                        setOauthBusy(false);
+                      }
+                    }}
+                    disabled={oauthBusy}
+                    className="px-3 py-1.5 text-sm font-medium bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white rounded-lg transition-colors"
+                  >
+                    {oauthBusy
+                      ? "Starting..."
+                      : "Connect Claude Pro/Max"}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setOauthBusy(true);
+                      setOauthError("");
+                      try {
+                        const res =
+                          await api.system.anthropicAuthorize("console");
+                        setOauthUrl(res.url);
+                        setOauthFlowId(res.flow_id);
+                      } catch (e) {
+                        setOauthError(
+                          e instanceof Error ? e.message : String(e)
+                        );
+                      } finally {
+                        setOauthBusy(false);
+                      }
+                    }}
+                    disabled={oauthBusy}
+                    className="px-3 py-1.5 text-sm font-medium bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-white rounded-lg transition-colors"
+                  >
+                    Connect via Console
+                  </button>
+                </div>
+              )}
+
+              {oauthUrl && !oauthConnected && (
+                <div className="flex flex-col gap-3">
+                  <div className="text-sm text-slate-300">
+                    <span className="font-medium">Step 1:</span> Open this
+                    link and authorize:
+                  </div>
+                  <a
+                    href={oauthUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-blue-400 hover:text-blue-300 underline break-all"
+                  >
+                    {oauthUrl.length > 80
+                      ? oauthUrl.slice(0, 80) + "..."
+                      : oauthUrl}
+                  </a>
+                  <div className="text-sm text-slate-300">
+                    <span className="font-medium">Step 2:</span> Paste the
+                    authorization code below:
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="Paste authorization code here"
+                      value={oauthCode}
+                      onChange={(e) => setOauthCode(e.target.value)}
+                      className={inputClass + " flex-1"}
+                    />
+                    <button
+                      onClick={async () => {
+                        if (!oauthCode.trim()) return;
+                        setOauthBusy(true);
+                        setOauthError("");
+                        try {
+                          await api.system.anthropicCallback(
+                            oauthFlowId,
+                            oauthCode.trim()
+                          );
+                          setOauthConnected(true);
+                          setOauthUrl("");
+                          setOauthCode("");
+                        } catch (e) {
+                          setOauthError(
+                            e instanceof Error ? e.message : String(e)
+                          );
+                        } finally {
+                          setOauthBusy(false);
+                        }
+                      }}
+                      disabled={oauthBusy || !oauthCode.trim()}
+                      className="px-4 py-2 text-sm font-medium bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      {oauthBusy ? "Connecting..." : "Connect"}
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setOauthUrl("");
+                      setOauthFlowId("");
+                      setOauthCode("");
+                      setOauthError("");
+                    }}
+                    className="text-xs text-slate-500 hover:text-slate-400 self-start"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              {oauthConnected && (
+                <p className="text-xs text-slate-500">
+                  OAuth tokens have been saved. You can reconnect anytime from
+                  Settings.
+                </p>
+              )}
+
+              {oauthError && (
+                <div className="text-sm text-red-400 bg-red-950/40 border border-red-800 rounded-lg px-3 py-2">
+                  {oauthError}
+                </div>
+              )}
+
+              {/* Manual API key fallback */}
+              {!oauthConnected && (
+                <div className="border-t border-slate-700 pt-3 mt-1">
+                  <p className="text-xs text-slate-500 mb-2">
+                    Or enter an API key manually:
+                  </p>
+                  <input
+                    type="password"
+                    placeholder="sk-ant-xxxxxxxxxxxx"
+                    value={anthropicKey}
+                    onChange={(e) => setAnthropicKey(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col gap-1.5">
