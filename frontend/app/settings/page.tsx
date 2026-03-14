@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Settings, EnvVar, DirFile, AgentsSkill, RecyclingPolicy, PortMapping, Instance } from "@/lib/api";
+import { api, Settings, EnvVar, DirFile, AgentsSkill, RecyclingPolicy, PortMapping, Instance, SystemInfo } from "@/lib/api";
 
 // Stable ID for env var rows so React keys don't depend on array index (#34)
 let _uidCounter = 0;
@@ -1074,6 +1074,19 @@ function SystemPanel() {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null);
+  const [copied, setCopied] = useState("");
+
+  useEffect(() => {
+    api.system.info().then(setSysInfo).catch(() => {});
+  }, []);
+
+  const copyUrl = (url: string, label: string) => {
+    navigator.clipboard.writeText(url).then(() => {
+      setCopied(label);
+      setTimeout(() => setCopied(""), 2000);
+    });
+  };
 
   const doReset = async () => {
     setBusy(true);
@@ -1092,11 +1105,63 @@ function SystemPanel() {
   };
 
   return (
-    <div>
-      <div className="text-sm text-slate-400 mb-6">
-        System management operations. These actions are irreversible.
+    <div className="flex flex-col gap-6">
+      {/* Backend Access URLs */}
+      <div className="border border-slate-700 rounded-lg p-5 bg-slate-900/40">
+        <h3 className="text-base font-semibold text-white mb-3">
+          Backend API Access
+        </h3>
+        <p className="text-sm text-slate-400 mb-4">
+          Use these URLs to access the CloudCode API from other systems,
+          scripts, or embedded in web pages.
+        </p>
+        {sysInfo ? (
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center gap-3">
+              <span className="text-xs font-medium text-slate-400 w-14 shrink-0">
+                HTTP
+              </span>
+              <code className="flex-1 text-sm font-mono text-blue-300 bg-slate-800 px-3 py-1.5 rounded border border-slate-700 select-all">
+                {sysInfo.http_url}
+              </code>
+              <button
+                onClick={() => copyUrl(sysInfo.http_url, "http")}
+                className="px-2 py-1 text-xs text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 rounded transition-colors"
+              >
+                {copied === "http" ? "Copied" : "Copy"}
+              </button>
+            </div>
+            {sysInfo.https_url && (
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-medium text-green-400 w-14 shrink-0">
+                  HTTPS
+                </span>
+                <code className="flex-1 text-sm font-mono text-green-300 bg-slate-800 px-3 py-1.5 rounded border border-slate-700 select-all">
+                  {sysInfo.https_url}
+                </code>
+                <button
+                  onClick={() => copyUrl(sysInfo.https_url!, "https")}
+                  className="px-2 py-1 text-xs text-slate-400 hover:text-white bg-slate-700 hover:bg-slate-600 rounded transition-colors"
+                >
+                  {copied === "https" ? "Copied" : "Copy"}
+                </button>
+              </div>
+            )}
+            {sysInfo.https_url && (
+              <p className="text-xs text-slate-500 mt-1">
+                The HTTPS endpoint uses a self-signed certificate. Use this URL
+                when embedding API calls from HTTPS pages to avoid
+                mixed-content errors. Clients may need to trust the self-signed
+                cert or use a proper certificate.
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-500">Loading...</div>
+        )}
       </div>
 
+      {/* Factory Reset */}
       <div className="border border-red-800/50 rounded-lg p-5 bg-red-950/20">
         <h3 className="text-base font-semibold text-red-400 mb-2">
           Factory Reset

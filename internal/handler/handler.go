@@ -59,6 +59,8 @@ type Handler struct {
 	config        *config.Manager
 	spaFS         fs.FS
 	accessToken   string
+	httpAddr      string        // HTTP listen address (e.g. ":8080")
+	tlsAddr       string        // HTTPS listen address (e.g. ":8443"), empty if TLS disabled
 	corsOrigins   []string      // allowed dev origins for WS CheckOrigin
 	recyclingMu   sync.Mutex    // prevents concurrent enforceRecyclingPolicy runs
 	sessions      sync.Map      // sessionID (string) → sessionEntry
@@ -79,7 +81,7 @@ type loginState struct {
 // New creates a new Handler. spaFiles is an fs.FS rooted at the frontend dist
 // directory (must contain index.html). Pass nil to disable SPA serving (returns
 // 404 for all non-API routes).
-func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager, spaFiles fs.FS, accessToken string, corsOrigins []string) *Handler {
+func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *config.Manager, spaFiles fs.FS, accessToken string, corsOrigins []string, httpAddr string, tlsAddr string) *Handler {
 	h := &Handler{
 		store:       s,
 		docker:      dm,
@@ -87,6 +89,8 @@ func New(s *store.Store, dm *docker.Manager, rp *proxy.ReverseProxy, cfgMgr *con
 		config:      cfgMgr,
 		spaFS:       spaFiles,
 		accessToken: accessToken,
+		httpAddr:    httpAddr,
+		tlsAddr:     tlsAddr,
 		corsOrigins: corsOrigins,
 		done:        make(chan struct{}),
 	}
@@ -222,6 +226,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/status/instances", h.auth(http.HandlerFunc(h.apiBatchInstanceStatus)))
 
 	// --- System API (protected) ---
+	mux.Handle("GET /api/system/info", h.auth(http.HandlerFunc(h.apiSystemInfo)))
 	mux.Handle("GET /api/system/resources", h.auth(http.HandlerFunc(h.apiSystemResources)))
 	mux.Handle("GET /api/system/setup-status", h.auth(http.HandlerFunc(h.apiSetupStatus)))
 	mux.Handle("POST /api/system/setup", h.auth(http.HandlerFunc(h.apiSetup)))
@@ -1135,6 +1140,39 @@ func (h *Handler) apiRegenerateToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- System API ---
+
+func (h *Handler) apiSystemInfo(w http.ResponseWriter, r *http.Request) {
+	info := map[string]any{
+		"http_addr": h.httpAddr,
+		"tls_addr":  h.tlsAddr,
+	}
+
+	// Derive backend access URLs from the request host.
+	host := r.Host
+	if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
+		host = host[:colonIdx]
+	}
+	if host == "" {
+		host = "localhost"
+	}
+
+	// Parse port from httpAddr (e.g. ":8080" or "0.0.0.0:8080")
+	httpPort := h.httpAddr
+	if idx := strings.LastIndex(httpPort, ":"); idx != -1 {
+		httpPort = httpPort[idx+1:]
+	}
+	info["http_url"] = fmt.Sprintf("http://%s:%s", host, httpPort)
+
+	if h.tlsAddr != "" {
+		tlsPort := h.tlsAddr
+		if idx := strings.LastIndex(tlsPort, ":"); idx != -1 {
+			tlsPort = tlsPort[idx+1:]
+		}
+		info["https_url"] = fmt.Sprintf("https://%s:%s", host, tlsPort)
+	}
+
+	writeJSON(w, http.StatusOK, info)
+}
 
 func (h *Handler) apiSystemResources(w http.ResponseWriter, r *http.Request) {
 	totalMemMB := hostMemoryMB()

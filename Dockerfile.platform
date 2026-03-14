@@ -16,6 +16,6 @@ COPY --from=builder /build/cloudcode /app/cloudcode
 COPY templates/ /app/templates/
 COPY static/ /app/static/
 
-EXPOSE 8080
+EXPOSE 8080 8443
 
-ENTRYPOINT ["/app/cloudcode", "-addr", ":8080", "-data", "/app/data"]
+ENTRYPOINT ["/app/cloudcode", "-addr", ":8080", "-tls-addr", ":8443", "-data", "/app/data"]

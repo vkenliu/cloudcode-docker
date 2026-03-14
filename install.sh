@@ -23,6 +23,7 @@ set -euo pipefail
 INSTALL_DIR="/opt/cloudcode"
 DATA_DIR=""  # set later if not overridden
 BACKEND_PORT=8080
+BACKEND_TLS_PORT=8443
 FRONTEND_PORT=3000
 ACCESS_TOKEN=""
 SKIP_BASE_IMAGE=false
@@ -76,6 +77,7 @@ log "Starting CloudCode installation..."
 info "Install dir    : ${INSTALL_DIR}"
 info "Data dir       : ${DATA_DIR}"
 info "Backend port   : ${BACKEND_PORT}"
+info "Backend TLS    : ${BACKEND_TLS_PORT}"
 info "Frontend port  : ${FRONTEND_PORT}"
 info "China mirror   : ${CHINA_MIRROR}"
 echo ""
@@ -466,6 +468,16 @@ build_cors_origins() {
         origins="${origins},http://${public_ip}:${FRONTEND_PORT}"
     fi
 
+    # Also allow HTTPS origins (for HTTPS backend access from HTTPS pages)
+    origins="${origins},https://localhost:${BACKEND_TLS_PORT}"
+    for ip in $ips; do
+        [[ "$ip" == 127.* ]] && continue
+        origins="${origins},https://${ip}:${BACKEND_TLS_PORT}"
+    done
+    if [[ -n "$public_ip" ]]; then
+        origins="${origins},https://${public_ip}:${BACKEND_TLS_PORT}"
+    fi
+
     CORS_ORIGINS="$origins"
     info "CORS origins: ${CORS_ORIGINS}"
 }
@@ -481,6 +493,7 @@ services:
     container_name: cloudcode
     ports:
       - "${BACKEND_PORT}:8080"
+      - "${BACKEND_TLS_PORT}:8443"
     environment:
       - HOST_DATA_DIR=${DATA_DIR}
     volumes:

@@ -86,6 +86,13 @@ export interface SystemResources {
   total_cpu_cores: number;
 }
 
+export interface SystemInfo {
+  http_addr: string;
+  tls_addr: string;
+  http_url: string;
+  https_url?: string;
+}
+
 export interface ApiError {
   error: string;
 }
@@ -355,6 +362,10 @@ export const api = {
   // System
   // ============================================================
   system: {
+    info(): Promise<SystemInfo> {
+      return request("GET", "/api/system/info");
+    },
+
     resources(): Promise<SystemResources> {
       return request("GET", "/api/system/resources");
     },
