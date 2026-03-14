@@ -429,14 +429,23 @@ setup_frontend_image() {
 build_cors_origins() {
     local origins="http://localhost:${FRONTEND_PORT}"
 
-    # Add all non-loopback IPs (public and private)
+    # Add all non-loopback local IPs (private/public)
     local ips
     ips=$(hostname -I 2>/dev/null || true)
     for ip in $ips; do
-        # Skip loopback
         [[ "$ip" == 127.* ]] && continue
         origins="${origins},http://${ip}:${FRONTEND_PORT}"
     done
+
+    # Detect public IP (cloud VMs often NAT the public IP, so it's not on any interface)
+    local public_ip
+    public_ip=$(curl -sf --max-time 3 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null \
+             || curl -sf --max-time 3 https://ifconfig.me 2>/dev/null \
+             || curl -sf --max-time 3 https://api.ipify.org 2>/dev/null \
+             || true)
+    if [[ -n "$public_ip" && "$origins" != *"${public_ip}"* ]]; then
+        origins="${origins},http://${public_ip}:${FRONTEND_PORT}"
+    fi
 
     CORS_ORIGINS="$origins"
     info "CORS origins: ${CORS_ORIGINS}"
