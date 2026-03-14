@@ -66,11 +66,19 @@ export interface Settings {
   shutdown_script: string;
   cors_origins: string[];
   recycling_policy: RecyclingPolicy;
+  port_mappings: PortMapping[];
 }
 
 export interface RecyclingPolicy {
   enabled: boolean;
   max_stopped_count: number;
+}
+
+export interface PortMapping {
+  host_port: number;
+  container_port: number;
+  protocol: "tcp" | "udp";
+  instance_id: string;
 }
 
 export interface SystemResources {
@@ -455,6 +463,10 @@ export const api = {
 
     saveRecyclingPolicy(policy: RecyclingPolicy): Promise<void> {
       return request("PUT", "/api/settings/recycling", policy);
+    },
+
+    savePortMappings(mappings: PortMapping[]): Promise<void> {
+      return request("PUT", "/api/settings/port-mappings", { mappings });
     },
   },
 };

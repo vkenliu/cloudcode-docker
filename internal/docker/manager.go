@@ -179,6 +179,35 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 	}
 
 	exposedPort := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
+	exposedPorts := network.PortSet{
+		exposedPort: struct{}{},
+	}
+	portBindings := network.PortMap{
+		exposedPort: []network.PortBinding{
+			{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "0"},
+		},
+	}
+
+	// Apply user-defined port mappings for this instance (from global config).
+	if m.config != nil {
+		if pms, err := m.config.GetPortMappingsForInstance(inst.ID); err == nil {
+			for _, pm := range pms {
+				proto := pm.Protocol
+				if proto != "tcp" && proto != "udp" {
+					proto = "tcp"
+				}
+				cPort := network.MustParsePort(fmt.Sprintf("%d/%s", pm.ContainerPort, proto))
+				exposedPorts[cPort] = struct{}{}
+				portBindings[cPort] = append(portBindings[cPort], network.PortBinding{
+					HostIP:   netip.MustParseAddr("0.0.0.0"),
+					HostPort: fmt.Sprintf("%d", pm.HostPort),
+				})
+			}
+		} else {
+			log.Printf("Warning: failed to get port mappings for instance %s: %v", inst.ID, err)
+		}
+	}
+
 	resp, err := m.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name: containerName,
 		Config: &container.Config{
@@ -190,9 +219,7 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				labelInstID:  inst.ID,
 			},
 			// ExposedPorts is required for Docker to honour PortBindings.
-			ExposedPorts: network.PortSet{
-				exposedPort: struct{}{},
-			},
+			ExposedPorts: exposedPorts,
 		},
 		HostConfig: &container.HostConfig{
 			Mounts: mounts,
@@ -200,16 +227,10 @@ func (m *Manager) CreateContainer(ctx context.Context, inst *store.Instance) (st
 				Name: "unless-stopped",
 			},
 			Resources: inst.ContainerResources(),
-			// Publish the container port to a random host port (Docker picks it).
-			// Binding to 127.0.0.1 keeps it inaccessible from the network.
-			// The proxy reads the assigned host port via GetContainerIPAndPort and
-			// routes through 127.0.0.1:<hostPort>, which is reliable regardless of
-			// what address opencode binds to inside the container.
-			PortBindings: network.PortMap{
-				exposedPort: []network.PortBinding{
-					{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: "0"},
-				},
-			},
+			// The opencode web UI port is published to 127.0.0.1:0 (random
+			// loopback port). User-defined port mappings bind to 0.0.0.0
+			// (publicly accessible) on the configured host port.
+			PortBindings: portBindings,
 		},
 		NetworkingConfig: &network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{

@@ -25,10 +25,19 @@ const (
 	FileEnvVars        = "env.json"
 	FileCORSOrigins    = "cors.json"
 	FileRecycling      = "recycling.json"
-	FileStartupScript  = "startup.sh"  // executed by entrypoint on every container start
-	FileShutdownScript = "shutdown.sh" // executed before container stop
-	FileSetupDone      = ".setup-done" // marker file indicating setup wizard was completed
+	FileStartupScript  = "startup.sh"         // executed by entrypoint on every container start
+	FileShutdownScript = "shutdown.sh"        // executed before container stop
+	FileSetupDone      = ".setup-done"        // marker file indicating setup wizard was completed
+	FilePortMappings   = "port-mappings.json" // global port mapping table
 )
+
+// PortMapping maps a host port to a container port for a specific instance.
+type PortMapping struct {
+	HostPort      int    `json:"host_port"`      // 9000–9999
+	ContainerPort int    `json:"container_port"` // any valid port
+	Protocol      string `json:"protocol"`       // "tcp" or "udp"
+	InstanceID    string `json:"instance_id"`    // target instance
+}
 
 // RecyclingPolicy defines the auto-cleanup policy for stopped instances.
 type RecyclingPolicy struct {
@@ -341,6 +350,47 @@ func (m *Manager) GetShutdownScript() (string, error) {
 func (m *Manager) SetShutdownScript(content string) error {
 	p := filepath.Join(m.rootDir, FileShutdownScript)
 	return os.WriteFile(p, []byte(content), 0750)
+}
+
+// GetPortMappings returns the global port mapping table, or an empty slice if not configured.
+func (m *Manager) GetPortMappings() ([]PortMapping, error) {
+	p := filepath.Join(m.rootDir, FilePortMappings)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []PortMapping{}, nil
+		}
+		return nil, err
+	}
+	var mappings []PortMapping
+	if err := json.Unmarshal(data, &mappings); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", FilePortMappings, err)
+	}
+	return mappings, nil
+}
+
+// SetPortMappings writes the port mapping table to port-mappings.json.
+func (m *Manager) SetPortMappings(mappings []PortMapping) error {
+	data, err := json.MarshalIndent(mappings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(m.rootDir, FilePortMappings), data, 0600)
+}
+
+// GetPortMappingsForInstance returns only the port mappings targeting a specific instance.
+func (m *Manager) GetPortMappingsForInstance(instanceID string) ([]PortMapping, error) {
+	all, err := m.GetPortMappings()
+	if err != nil {
+		return nil, err
+	}
+	var result []PortMapping
+	for _, pm := range all {
+		if pm.InstanceID == instanceID {
+			result = append(result, pm)
+		}
+	}
+	return result, nil
 }
 
 // IsSetupDone checks whether the first-time setup wizard has been completed.

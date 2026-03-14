@@ -242,6 +242,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/settings/agents-skill", h.auth(http.HandlerFunc(h.apiDeleteAgentsSkill)))
 	mux.Handle("PUT /api/settings/cors", h.auth(http.HandlerFunc(h.apiSaveCORSOrigins)))
 	mux.Handle("PUT /api/settings/recycling", h.auth(http.HandlerFunc(h.apiSaveRecyclingPolicy)))
+	mux.Handle("PUT /api/settings/port-mappings", h.auth(http.HandlerFunc(h.apiSavePortMappings)))
 
 	// --- WebSocket endpoints (protected via cookie OR one-time ?token=) ---
 	mux.HandleFunc("GET /instances/{id}/logs/ws", h.handleLogsWS)
@@ -1535,6 +1536,12 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	// Recycling policy
 	recyclingPolicy, _ := h.config.GetRecyclingPolicy()
 
+	// Port mappings
+	portMappings, _ := h.config.GetPortMappings()
+	if portMappings == nil {
+		portMappings = []config.PortMapping{}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"config_dir":         configDir,
 		"env_vars":           envVars,
@@ -1546,6 +1553,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"shutdown_script":    shutdownScript,
 		"cors_origins":       corsOrigins,
 		"recycling_policy":   recyclingPolicy,
+		"port_mappings":      portMappings,
 	})
 }
 
@@ -1680,6 +1688,58 @@ func (h *Handler) apiSaveRecyclingPolicy(w http.ResponseWriter, r *http.Request)
 		h.enforceRecyclingPolicy()
 	}
 
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSavePortMappings(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Mappings []config.PortMapping `json:"mappings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate each mapping.
+	seen := make(map[string]bool) // "hostPort/proto" → already used
+	for i, pm := range req.Mappings {
+		if pm.HostPort < 9000 || pm.HostPort > 9999 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: host_port must be 9000–9999 (got %d)", i+1, pm.HostPort))
+			return
+		}
+		if pm.ContainerPort < 1 || pm.ContainerPort > 65535 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: container_port must be 1–65535 (got %d)", i+1, pm.ContainerPort))
+			return
+		}
+		if pm.Protocol != "tcp" && pm.Protocol != "udp" {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: protocol must be \"tcp\" or \"udp\" (got %q)", i+1, pm.Protocol))
+			return
+		}
+		if pm.InstanceID == "" {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: instance_id is required", i+1))
+			return
+		}
+		// Check for duplicate host port + protocol.
+		key := fmt.Sprintf("%d/%s", pm.HostPort, pm.Protocol)
+		if seen[key] {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: duplicate host port %s", i+1, key))
+			return
+		}
+		seen[key] = true
+
+		// Verify instance exists.
+		if _, err := h.store.Get(pm.InstanceID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("mapping %d: instance %q not found", i+1, pm.InstanceID))
+			return
+		}
+	}
+
+	if err := h.config.SetPortMappings(req.Mappings); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save port mappings: "+err.Error())
+		return
+	}
+	log.Printf("Port mappings updated: %d mapping(s)", len(req.Mappings))
 	writeNoContent(w)
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Settings, EnvVar, DirFile, AgentsSkill, RecyclingPolicy } from "@/lib/api";
+import { api, Settings, EnvVar, DirFile, AgentsSkill, RecyclingPolicy, PortMapping, Instance } from "@/lib/api";
 
 // Stable ID for env var rows so React keys don't depend on array index (#34)
 let _uidCounter = 0;
@@ -857,6 +857,216 @@ function OpenCodeSettingsPanel({
 }
 
 // ============================================================
+// Port Mappings editor
+// ============================================================
+
+type PortMappingRow = PortMapping & { _uid: number };
+
+function PortMappingsEditor({
+  initial,
+  onSaved,
+}: {
+  initial: PortMapping[];
+  onSaved: () => void;
+}) {
+  const [rows, setRows] = useState<PortMappingRow[]>(() =>
+    initial.map((pm) => ({ ...pm, _uid: nextUid() }))
+  );
+  const [instances, setInstances] = useState<Instance[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const dirtyRef = useRef(false);
+
+  // Load instance list for the dropdown.
+  useEffect(() => {
+    api.instances.list().then(setInstances).catch(() => {});
+  }, []);
+
+  // Sync with parent when initial changes (only if not dirty).
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      setRows(initial.map((pm) => ({ ...pm, _uid: nextUid() })));
+    }
+  }, [initial]);
+
+  const addRow = () => {
+    dirtyRef.current = true;
+    setRows((prev) => [
+      ...prev,
+      {
+        host_port: 9000,
+        container_port: 8080,
+        protocol: "tcp" as const,
+        instance_id: instances[0]?.id ?? "",
+        _uid: nextUid(),
+      },
+    ]);
+  };
+
+  const removeRow = (uid: number) => {
+    dirtyRef.current = true;
+    setRows((prev) => prev.filter((r) => r._uid !== uid));
+  };
+
+  const updateRow = (uid: number, field: keyof PortMapping, value: string | number) => {
+    dirtyRef.current = true;
+    setSaved(false);
+    setRows((prev) =>
+      prev.map((r) => (r._uid === uid ? { ...r, [field]: value } : r))
+    );
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      const mappings: PortMapping[] = rows.map(({ _uid, ...pm }) => pm);
+      await api.settings.savePortMappings(mappings);
+      dirtyRef.current = false;
+      setSaved(true);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputClass =
+    "px-2 py-1.5 rounded bg-slate-900 border border-slate-600 text-slate-100 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-transparent";
+  const selectClass =
+    "px-2 py-1.5 rounded bg-slate-900 border border-slate-600 text-slate-100 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-transparent";
+
+  return (
+    <div className="flex flex-col gap-4">
+      {rows.length === 0 ? (
+        <div className="text-sm text-slate-500 py-4 text-center">
+          No port mappings configured.
+        </div>
+      ) : (
+        <div className="overflow-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-slate-700">
+                <th className="text-left py-2 px-2 text-slate-400 font-medium">
+                  Host Port
+                </th>
+                <th className="text-left py-2 px-2 text-slate-400 font-medium">
+                  Container Port
+                </th>
+                <th className="text-left py-2 px-2 text-slate-400 font-medium">
+                  Protocol
+                </th>
+                <th className="text-left py-2 px-2 text-slate-400 font-medium">
+                  Instance
+                </th>
+                <th className="py-2 px-2 w-10"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr
+                  key={row._uid}
+                  className="border-b border-slate-700/50 hover:bg-slate-700/30"
+                >
+                  <td className="py-1.5 px-2">
+                    <input
+                      type="number"
+                      min={9000}
+                      max={9999}
+                      value={row.host_port}
+                      onChange={(e) =>
+                        updateRow(
+                          row._uid,
+                          "host_port",
+                          Math.max(9000, Math.min(9999, parseInt(e.target.value) || 9000))
+                        )
+                      }
+                      className={inputClass + " w-24"}
+                    />
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={row.container_port}
+                      onChange={(e) =>
+                        updateRow(
+                          row._uid,
+                          "container_port",
+                          Math.max(1, Math.min(65535, parseInt(e.target.value) || 1))
+                        )
+                      }
+                      className={inputClass + " w-24"}
+                    />
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <select
+                      value={row.protocol}
+                      onChange={(e) =>
+                        updateRow(row._uid, "protocol", e.target.value)
+                      }
+                      className={selectClass + " w-20"}
+                    >
+                      <option value="tcp">TCP</option>
+                      <option value="udp">UDP</option>
+                    </select>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <select
+                      value={row.instance_id}
+                      onChange={(e) =>
+                        updateRow(row._uid, "instance_id", e.target.value)
+                      }
+                      className={selectClass + " w-48"}
+                    >
+                      <option value="">-- select --</option>
+                      {instances.map((inst) => (
+                        <option key={inst.id} value={inst.id}>
+                          {inst.name} ({inst.id})
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="py-1.5 px-2 text-center">
+                    <button
+                      onClick={() => removeRow(row._uid)}
+                      className="text-red-400 hover:text-red-300 text-lg leading-none"
+                      title="Remove mapping"
+                    >
+                      x
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          onClick={addRow}
+          className="px-3 py-1.5 text-sm font-medium bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
+        >
+          + Add Mapping
+        </button>
+        <SaveBtn busy={busy} saved={saved} onClick={save} />
+      </div>
+
+      {error && (
+        <div className="text-sm text-red-400 bg-red-950/40 border border-red-800 rounded-lg px-3 py-2">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // System panel (reset)
 // ============================================================
 
@@ -941,6 +1151,7 @@ type TabKey =
   | "shutdown-script"
   | "config-files"
   | "opencode-settings"
+  | "port-mappings"
   | "cors"
   | "recycling"
   | "directory-mappings"
@@ -976,6 +1187,7 @@ export default function SettingsPage() {
     { key: "shutdown-script", label: "Shutdown Script" },
     { key: "config-files", label: "Config Files" },
     { key: "opencode-settings", label: "OpenCode Settings" },
+    { key: "port-mappings", label: "Port Mappings" },
     { key: "cors", label: "CORS" },
     { key: "recycling", label: "Recycling" },
     { key: "directory-mappings", label: "Dir Mappings" },
@@ -1107,6 +1319,21 @@ export default function SettingsPage() {
         {/* --- OpenCode Settings (consolidated) --- */}
         {activeTab === "opencode-settings" && (
           <OpenCodeSettingsPanel settings={settings} onChanged={loadSettings} />
+        )}
+
+        {/* --- Port Mappings --- */}
+        {activeTab === "port-mappings" && (
+          <div>
+            <div className="text-sm text-slate-400 mb-4">
+              Map host TCP/UDP ports (9000–9999) to container ports on specific
+              instances. This exposes the container port to public access.
+              Changes require an instance restart to take effect.
+            </div>
+            <PortMappingsEditor
+              initial={settings.port_mappings ?? []}
+              onSaved={loadSettings}
+            />
+          </div>
         )}
 
         {/* --- CORS Origins --- */}
