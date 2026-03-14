@@ -210,8 +210,13 @@ create_directories() {
 # ── Step 5: Build or pull the base image ──────────────────────────────────────
 setup_base_image() {
     if [[ "$SKIP_BASE_IMAGE" == true ]]; then
-        err "No pre-built base image available. Please remove --skip-base-image to build from source."
-        exit 1
+        if docker image inspect "${BASE_IMAGE}" &>/dev/null; then
+            log "Skipping base image build (already exists: ${BASE_IMAGE})"
+            return 0
+        else
+            err "No base image found and --skip-base-image was set. Remove the flag to build from source."
+            exit 1
+        fi
     fi
 
     log "Building base image (this may take 10-30 minutes)..."
