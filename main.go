@@ -11,6 +11,7 @@ import (
 	"embed"
 	"encoding/pem"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"math/big"
@@ -130,12 +131,18 @@ func main() {
 	if !*noTLS {
 		certFile := *tlsCert
 		keyFile := *tlsKey
-		if certFile == "" || keyFile == "" {
+		// Validate: both --tls-cert and --tls-key must be provided together.
+		if (certFile == "") != (keyFile == "") {
+			log.Fatal("--tls-cert and --tls-key must both be provided, or both omitted for auto-generation")
+		}
+		if certFile == "" {
 			// Auto-generate a self-signed cert in the data dir.
 			certFile = filepath.Join(*dataDir, "tls", "cert.pem")
 			keyFile = filepath.Join(*dataDir, "tls", "key.pem")
 			if err := ensureSelfSignedCert(certFile, keyFile); err != nil {
 				log.Printf("Warning: failed to generate self-signed TLS cert: %v (HTTPS disabled)", err)
+				certFile = ""
+				keyFile = ""
 			}
 		}
 		if certFile != "" && keyFile != "" {
@@ -212,7 +219,10 @@ func ensureSelfSignedCert(certFile, keyFile string) error {
 		return err
 	}
 
-	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return fmt.Errorf("generate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "CloudCode Self-Signed"},

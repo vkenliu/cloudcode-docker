@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -1159,27 +1160,35 @@ func (h *Handler) apiSystemInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Derive backend access URLs from the request host.
-	host := r.Host
-	if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
-		host = host[:colonIdx]
+	// Use net.SplitHostPort to correctly handle IPv6 addresses like [::1]:8080.
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		// r.Host may lack a port (e.g. behind a proxy). Use it as-is.
+		host = r.Host
 	}
 	if host == "" {
 		host = "localhost"
 	}
 
-	// Parse port from httpAddr (e.g. ":8080" or "0.0.0.0:8080")
-	httpPort := h.httpAddr
-	if idx := strings.LastIndex(httpPort, ":"); idx != -1 {
-		httpPort = httpPort[idx+1:]
+	// Format host for URLs: wrap IPv6 addresses in brackets.
+	urlHost := host
+	if net.ParseIP(host) != nil && strings.Contains(host, ":") {
+		urlHost = "[" + host + "]"
 	}
-	info["http_url"] = fmt.Sprintf("http://%s:%s", host, httpPort)
+
+	// Parse port from httpAddr (e.g. ":8080" or "0.0.0.0:8080")
+	_, httpPort, _ := net.SplitHostPort(h.httpAddr)
+	if httpPort == "" {
+		httpPort = "8080"
+	}
+	info["http_url"] = fmt.Sprintf("http://%s:%s", urlHost, httpPort)
 
 	if h.tlsAddr != "" {
-		tlsPort := h.tlsAddr
-		if idx := strings.LastIndex(tlsPort, ":"); idx != -1 {
-			tlsPort = tlsPort[idx+1:]
+		_, tlsPort, _ := net.SplitHostPort(h.tlsAddr)
+		if tlsPort == "" {
+			tlsPort = "8443"
 		}
-		info["https_url"] = fmt.Sprintf("https://%s:%s", host, tlsPort)
+		info["https_url"] = fmt.Sprintf("https://%s:%s", urlHost, tlsPort)
 	}
 
 	writeJSON(w, http.StatusOK, info)
