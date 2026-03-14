@@ -290,19 +290,30 @@ func (h *Handler) auth(next http.Handler) http.Handler {
 	})
 }
 
-// isAuthenticated returns true if the request carries a valid, non-expired session cookie.
+// isAuthenticated returns true if the request carries a valid, non-expired
+// session cookie OR a valid platform access token in the Authorization header
+// (Bearer token). The Bearer token path supports programmatic API access and
+// embedding API calls from HTTPS pages without a prior login.
 func (h *Handler) isAuthenticated(r *http.Request) bool {
-	c, err := r.Cookie(sessionCookieName)
-	if err != nil || c.Value == "" {
-		return false
+	// 1. Session cookie (browser UI flow).
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		if v, ok := h.sessions.Load(c.Value); ok {
+			if e, ok := v.(sessionEntry); ok && time.Since(e.createdAt) <= sessionTTL {
+				return true
+			}
+		}
 	}
-	v, ok := h.sessions.Load(c.Value)
-	if !ok {
-		return false
+	// 2. Authorization: Bearer <access-token> (API / programmatic access).
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		const prefix = "Bearer "
+		if strings.HasPrefix(auth, prefix) {
+			token := strings.TrimSpace(auth[len(prefix):])
+			if len(token) > 0 && subtle.ConstantTimeCompare([]byte(token), []byte(h.accessToken)) == 1 {
+				return true
+			}
+		}
 	}
-	// Enforce TTL even if the prune goroutine hasn't run yet.
-	e, ok := v.(sessionEntry)
-	return ok && time.Since(e.createdAt) <= sessionTTL
+	return false
 }
 
 // isAuthenticatedWS returns true for WebSocket upgrade requests.
