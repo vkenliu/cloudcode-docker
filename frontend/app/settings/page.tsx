@@ -289,6 +289,72 @@ function StartupScriptEditor({
 }
 
 // ============================================================
+// Shutdown script editor
+// ============================================================
+
+function ShutdownScriptEditor({
+  initialScript,
+  onSaved,
+}: {
+  initialScript: string;
+  onSaved: () => void;
+}) {
+  const [script, setScript] = useState(initialScript);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+  const dirtyRef = useRef(false);
+
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      setScript(initialScript);
+    }
+  }, [initialScript]);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.settings.saveShutdownScript(script);
+      setSaved(true);
+      dirtyRef.current = false;
+      setTimeout(() => setSaved(false), 2000);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="text-sm text-slate-400">
+        Shell script executed automatically before each container stops (stop or
+        restart). Runs as <code className="text-slate-300 bg-slate-900 px-1 py-0.5 rounded text-xs">bash</code> via{" "}
+        <code className="text-slate-300 bg-slate-900 px-1 py-0.5 rounded text-xs">docker exec</code>.
+        Has a 30-second timeout. Applied to all instances on next stop/restart.
+      </div>
+      <textarea
+        value={script}
+        onChange={(e) => {
+          dirtyRef.current = true;
+          setScript(e.target.value);
+        }}
+        rows={20}
+        placeholder={"#!/bin/bash\n# Example: clean up temp files before shutdown\nrm -rf /tmp/workspace-cache\n"}
+        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-y"
+        spellCheck={false}
+      />
+      {error && <div className="text-red-400 text-xs">{error}</div>}
+      <div>
+        <SaveBtn busy={busy} saved={saved} onClick={save} />
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // Directory file manager
 // ============================================================
 
@@ -737,6 +803,7 @@ function RecyclingPolicyEditor({
 type TabKey =
   | "env"
   | "startup-script"
+  | "shutdown-script"
   | "config-files"
   | "commands"
   | "agents"
@@ -774,6 +841,7 @@ export default function SettingsPage() {
   const tabs: { key: TabKey; label: string }[] = [
     { key: "env", label: "Env Vars" },
     { key: "startup-script", label: "Startup Script" },
+    { key: "shutdown-script", label: "Shutdown Script" },
     { key: "config-files", label: "Config Files" },
     { key: "commands", label: "Commands" },
     { key: "agents", label: "Agents" },
@@ -844,6 +912,14 @@ export default function SettingsPage() {
         {activeTab === "startup-script" && (
           <StartupScriptEditor
             initialScript={settings.startup_script ?? ""}
+            onSaved={loadSettings}
+          />
+        )}
+
+        {/* --- Shutdown Script --- */}
+        {activeTab === "shutdown-script" && (
+          <ShutdownScriptEditor
+            initialScript={settings.shutdown_script ?? ""}
             onSaved={loadSettings}
           />
         )}

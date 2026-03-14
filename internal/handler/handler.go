@@ -224,6 +224,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/settings", h.auth(http.HandlerFunc(h.apiGetSettings)))
 	mux.Handle("PUT /api/settings/env", h.auth(http.HandlerFunc(h.apiSaveEnvVars)))
 	mux.Handle("PUT /api/settings/startup-script", h.auth(http.HandlerFunc(h.apiSaveStartupScript)))
+	mux.Handle("PUT /api/settings/shutdown-script", h.auth(http.HandlerFunc(h.apiSaveShutdownScript)))
 	mux.Handle("GET /api/settings/file", h.auth(http.HandlerFunc(h.apiGetConfigFile)))
 	mux.Handle("PUT /api/settings/file", h.auth(http.HandlerFunc(h.apiSaveConfigFile)))
 	mux.Handle("GET /api/settings/dir-files", h.auth(http.HandlerFunc(h.apiListDirFiles)))
@@ -819,6 +820,25 @@ func (h *Handler) apiStartInstance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toInstanceResponse(inst))
 }
 
+// runShutdownScript executes the shutdown script inside the container if one
+// exists. Errors are logged but never block the stop — the container will be
+// stopped regardless.
+func (h *Handler) runShutdownScript(ctx context.Context, containerID string) {
+	if h.docker == nil {
+		return
+	}
+	script, _ := h.config.GetShutdownScript()
+	if strings.TrimSpace(script) == "" {
+		return
+	}
+	log.Printf("Running shutdown script in container %s...", containerID)
+	if err := h.docker.ExecShutdownScript(ctx, containerID, 30*time.Second); err != nil {
+		log.Printf("Warning: shutdown script failed in container %s: %v", containerID, err)
+	} else {
+		log.Printf("Shutdown script completed in container %s", containerID)
+	}
+}
+
 func (h *Handler) apiStopInstance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	inst, err := h.store.Get(id)
@@ -828,6 +848,7 @@ func (h *Handler) apiStopInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if inst.ContainerID != "" && h.docker != nil {
+		h.runShutdownScript(r.Context(), inst.ContainerID)
 		if err := h.docker.StopContainer(r.Context(), inst.ContainerID); err != nil { // #7
 			writeError(w, http.StatusInternalServerError, "failed to stop container: "+err.Error())
 			return
@@ -860,6 +881,7 @@ func (h *Handler) apiRestartInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if inst.ContainerID != "" {
+		h.runShutdownScript(r.Context(), inst.ContainerID)
 		// #24: log stop/remove errors instead of silently ignoring
 		if err := h.docker.StopContainer(r.Context(), inst.ContainerID); err != nil { // #7
 			log.Printf("Warning: failed to stop container %s during restart: %v", inst.ContainerID, err)
@@ -1216,6 +1238,9 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	// Startup script
 	startupScript, _ := h.config.GetStartupScript()
 
+	// Shutdown script
+	shutdownScript, _ := h.config.GetShutdownScript()
+
 	// CORS origins
 	corsOrigins, _ := h.config.GetCORSOrigins()
 	if corsOrigins == nil {
@@ -1233,6 +1258,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"agents_skills":      agentsSkills,
 		"directory_mappings": mappings,
 		"startup_script":     startupScript,
+		"shutdown_script":    shutdownScript,
 		"cors_origins":       corsOrigins,
 		"recycling_policy":   recyclingPolicy,
 	})
@@ -1278,6 +1304,22 @@ func (h *Handler) apiSaveStartupScript(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.config.SetStartupScript(req.Script); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save startup script: "+err.Error())
+		return
+	}
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSaveShutdownScript(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
+	var req struct {
+		Script string `json:"script"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.config.SetShutdownScript(req.Script); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save shutdown script: "+err.Error())
 		return
 	}
 	writeNoContent(w)

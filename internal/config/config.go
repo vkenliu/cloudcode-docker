@@ -17,15 +17,16 @@ var instructionsFile []byte
 const instructionsFileName = "_cloudcode-instructions.md"
 
 const (
-	DirOpenCodeConfig = "opencode"      // → /root/.config/opencode/
-	DirOpenCodeData   = "opencode-data" // → /root/.local/share/opencode/
-	DirDotOpenCode    = "dot-opencode"  // → /root/.opencode/
-	DirAgentsSkills   = "agents-skills" // → /root/.agents/
-	DirAditCore       = "adit-core"     // → /root/.adit-core/
-	FileEnvVars       = "env.json"
-	FileCORSOrigins   = "cors.json"
-	FileRecycling     = "recycling.json"
-	FileStartupScript = "startup.sh" // executed by entrypoint on every container start
+	DirOpenCodeConfig  = "opencode"      // → /root/.config/opencode/
+	DirOpenCodeData    = "opencode-data" // → /root/.local/share/opencode/
+	DirDotOpenCode     = "dot-opencode"  // → /root/.opencode/
+	DirAgentsSkills    = "agents-skills" // → /root/.agents/
+	DirAditCore        = "adit-core"     // → /root/.adit-core/
+	FileEnvVars        = "env.json"
+	FileCORSOrigins    = "cors.json"
+	FileRecycling      = "recycling.json"
+	FileStartupScript  = "startup.sh"  // executed by entrypoint on every container start
+	FileShutdownScript = "shutdown.sh" // executed before container stop
 )
 
 // RecyclingPolicy defines the auto-cleanup policy for stopped instances.
@@ -322,6 +323,25 @@ func (m *Manager) SetStartupScript(content string) error {
 	return os.WriteFile(p, []byte(content), 0750)
 }
 
+// GetShutdownScript returns the contents of shutdown.sh, or empty string if it doesn't exist.
+func (m *Manager) GetShutdownScript() (string, error) {
+	p := filepath.Join(m.rootDir, FileShutdownScript)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(data), nil
+}
+
+// SetShutdownScript writes content to shutdown.sh and makes it executable.
+func (m *Manager) SetShutdownScript(content string) error {
+	p := filepath.Join(m.rootDir, FileShutdownScript)
+	return os.WriteFile(p, []byte(content), 0750)
+}
+
 // ReadFile reads a config file by relPath (e.g. "opencode/opencode.jsonc").
 // Returns empty string if file doesn't exist.
 // #1: validates path stays within rootDir.
@@ -396,6 +416,16 @@ func (m *Manager) ContainerMountsForInstance(instanceID string) ([]ContainerMoun
 		mounts = append(mounts, ContainerMount{
 			HostPath:      hostStartupPath,
 			ContainerPath: "/root/.config/cloudcode/startup.sh",
+		})
+	}
+
+	// Mount shutdown.sh only if it exists and is non-empty.
+	shutdownPath := filepath.Join(m.rootDir, FileShutdownScript)
+	if info, err := os.Stat(shutdownPath); err == nil && info.Size() > 0 {
+		hostShutdownPath := filepath.Join(root, FileShutdownScript)
+		mounts = append(mounts, ContainerMount{
+			HostPath:      hostShutdownPath,
+			ContainerPath: "/root/.config/cloudcode/shutdown.sh",
 		})
 	}
 

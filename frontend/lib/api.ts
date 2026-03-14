@@ -63,6 +63,7 @@ export interface Settings {
   agents_skills: AgentsSkill[];
   directory_mappings: { host: string; container: string }[];
   startup_script: string;
+  shutdown_script: string;
   cors_origins: string[];
   recycling_policy: RecyclingPolicy;
 }
@@ -404,6 +405,10 @@ export const api = {
 
     saveStartupScript(script: string): Promise<void> {
       return request("PUT", "/api/settings/startup-script", { script });
+    },
+
+    saveShutdownScript(script: string): Promise<void> {
+      return request("PUT", "/api/settings/shutdown-script", { script });
     },
 
     saveCORSOrigins(origins: string[]): Promise<void> {

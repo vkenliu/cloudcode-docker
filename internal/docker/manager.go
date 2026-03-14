@@ -303,6 +303,43 @@ func ContainerPort() int {
 	return containerPort
 }
 
+// ExecShutdownScript runs /root/.config/cloudcode/shutdown.sh inside a running
+// container via docker exec. It waits up to the given timeout for completion.
+// Returns nil if the script doesn't exist or the container is not running.
+func (m *Manager) ExecShutdownScript(ctx context.Context, containerID string, timeout time.Duration) error {
+	// Use a deadline so we don't block the stop indefinitely.
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	execID, err := m.cli.ExecCreate(execCtx, containerID, client.ExecCreateOptions{
+		Cmd:          []string{"bash", "-c", "[ -f /root/.config/cloudcode/shutdown.sh ] && bash /root/.config/cloudcode/shutdown.sh || true"},
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return fmt.Errorf("shutdown exec create: %w", err)
+	}
+
+	resp, err := m.cli.ExecAttach(execCtx, execID.ID, client.ExecAttachOptions{})
+	if err != nil {
+		return fmt.Errorf("shutdown exec attach: %w", err)
+	}
+	defer resp.Conn.Close()
+
+	// Drain output so the exec finishes (we discard it).
+	_, _ = io.Copy(io.Discard, resp.Reader)
+
+	// Check exit code.
+	inspect, err := m.cli.ExecInspect(execCtx, execID.ID, client.ExecInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("shutdown exec inspect: %w", err)
+	}
+	if inspect.ExitCode != 0 {
+		return fmt.Errorf("shutdown script exited with code %d", inspect.ExitCode)
+	}
+	return nil
+}
+
 func (m *Manager) StopContainer(ctx context.Context, containerID string) error {
 	timeout := 30
 	_, err := m.cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: &timeout})

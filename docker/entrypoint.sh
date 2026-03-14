@@ -45,4 +45,23 @@ fi
 echo "[4/4] Starting OpenCode Web UI on port ${PORT}..."
 echo "=== Ready ==="
 
-exec opencode web --port "${PORT}" --hostname 0.0.0.0
+# Run shutdown script (if present) on SIGTERM before forwarding the signal.
+# The platform also runs the script via docker exec before sending stop, so
+# this trap is defense-in-depth for external `docker stop` calls.
+_shutdown() {
+    echo "[*] Received SIGTERM"
+    if [ -f /root/.config/cloudcode/shutdown.sh ]; then
+        echo "[*] Running shutdown script..."
+        bash /root/.config/cloudcode/shutdown.sh || echo "[!] Shutdown script failed"
+        echo "[*] Shutdown script complete"
+    fi
+    # Forward SIGTERM to opencode
+    kill -TERM "$CHILD_PID" 2>/dev/null
+    wait "$CHILD_PID" 2>/dev/null
+    exit $?
+}
+trap _shutdown SIGTERM
+
+opencode web --port "${PORT}" --hostname 0.0.0.0 &
+CHILD_PID=$!
+wait "$CHILD_PID"
