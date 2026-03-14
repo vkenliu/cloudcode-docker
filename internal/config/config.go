@@ -27,6 +27,7 @@ const (
 	FileRecycling      = "recycling.json"
 	FileStartupScript  = "startup.sh"  // executed by entrypoint on every container start
 	FileShutdownScript = "shutdown.sh" // executed before container stop
+	FileSetupDone      = ".setup-done" // marker file indicating setup wizard was completed
 )
 
 // RecyclingPolicy defines the auto-cleanup policy for stopped instances.
@@ -340,6 +341,32 @@ func (m *Manager) GetShutdownScript() (string, error) {
 func (m *Manager) SetShutdownScript(content string) error {
 	p := filepath.Join(m.rootDir, FileShutdownScript)
 	return os.WriteFile(p, []byte(content), 0750)
+}
+
+// IsSetupDone checks whether the first-time setup wizard has been completed.
+func (m *Manager) IsSetupDone() bool {
+	_, err := os.Stat(filepath.Join(m.rootDir, FileSetupDone))
+	return err == nil
+}
+
+// MarkSetupDone creates the marker file indicating setup has been completed.
+func (m *Manager) MarkSetupDone() error {
+	return os.WriteFile(filepath.Join(m.rootDir, FileSetupDone), []byte("done\n"), 0600)
+}
+
+// ResetAll removes all configuration files and directories, then re-creates
+// the default directory structure. The config root directory itself is preserved.
+func (m *Manager) ResetAll() error {
+	entries, err := os.ReadDir(m.rootDir)
+	if err != nil {
+		return fmt.Errorf("read config dir: %w", err)
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(m.rootDir, e.Name())); err != nil {
+			return fmt.Errorf("remove %s: %w", e.Name(), err)
+		}
+	}
+	return m.ensureDirs()
 }
 
 // ReadFile reads a config file by relPath (e.g. "opencode/opencode.jsonc").

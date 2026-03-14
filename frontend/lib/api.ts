@@ -350,6 +350,26 @@ export const api = {
     resources(): Promise<SystemResources> {
       return request("GET", "/api/system/resources");
     },
+
+    /** Reset the entire system: stop/remove all instances, wipe config and DB. Server restarts automatically. */
+    reset(): Promise<void> {
+      return request("POST", "/api/system/reset");
+    },
+
+    /** Check whether first-time setup has been completed. */
+    setupStatus(): Promise<{ setup_complete: boolean }> {
+      return request("GET", "/api/system/setup-status");
+    },
+
+    /** Save first-time setup configuration. */
+    setup(payload: {
+      cors_origins?: string[];
+      recycling_policy?: RecyclingPolicy;
+      env_vars?: Record<string, string>;
+      auth_json?: Record<string, unknown>;
+    }): Promise<void> {
+      return request("POST", "/api/system/setup", payload);
+    },
   },
 
   // ============================================================

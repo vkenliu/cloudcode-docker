@@ -797,6 +797,141 @@ function RecyclingPolicyEditor({
 }
 
 // ============================================================
+// OpenCode Settings (consolidated panel)
+// ============================================================
+
+type OpenCodeSubTab = "commands" | "agents" | "skills" | "plugins" | "agents-skills";
+
+function OpenCodeSettingsPanel({
+  settings,
+  onChanged,
+}: {
+  settings: Settings;
+  onChanged: () => void;
+}) {
+  const [subTab, setSubTab] = useState<OpenCodeSubTab>("commands");
+
+  const subTabs: { key: OpenCodeSubTab; label: string }[] = [
+    { key: "commands", label: "Commands" },
+    { key: "agents", label: "Agents" },
+    { key: "skills", label: "Skills" },
+    { key: "plugins", label: "Plugins" },
+    { key: "agents-skills", label: "Agents Skills" },
+  ];
+
+  return (
+    <div>
+      <div className="text-sm text-slate-400 mb-4">
+        OpenCode configuration files shared across all instances. Commands,
+        agents, skills, and plugins are bind-mounted into every container.
+      </div>
+      <div className="flex gap-1 flex-wrap mb-4">
+        {subTabs.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setSubTab(t.key)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+              subTab === t.key
+                ? "bg-blue-600 text-white"
+                : "bg-slate-700 text-slate-300 hover:bg-slate-600"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {(["commands", "agents", "skills", "plugins"] as const).map(
+        (dir) =>
+          subTab === dir && (
+            <DirFileManager key={dir} dir={dir} files={settings.dirs[dir]} />
+          )
+      )}
+      {subTab === "agents-skills" && (
+        <AgentsSkillsPanel
+          skills={settings.agents_skills}
+          onChanged={onChanged}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// System panel (reset)
+// ============================================================
+
+function SystemPanel() {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const doReset = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.system.reset();
+      // Server will restart — redirect to setup wizard after a brief delay.
+      setTimeout(() => {
+        window.location.href = "/setup";
+      }, 2000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+      setConfirming(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="text-sm text-slate-400 mb-6">
+        System management operations. These actions are irreversible.
+      </div>
+
+      <div className="border border-red-800/50 rounded-lg p-5 bg-red-950/20">
+        <h3 className="text-base font-semibold text-red-400 mb-2">
+          Factory Reset
+        </h3>
+        <p className="text-sm text-slate-400 mb-4">
+          This will stop and remove all instances (containers and volumes), erase
+          all configuration files (env vars, scripts, config, auth), delete the
+          database, and restart the server. The system will return to a fresh
+          install state and redirect to the Setup Wizard.
+        </p>
+        {error && <div className="text-red-400 text-xs mb-3">{error}</div>}
+        {!confirming ? (
+          <button
+            onClick={() => setConfirming(true)}
+            className="px-4 py-2 text-sm font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
+          >
+            Reset System
+          </button>
+        ) : (
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-red-300 font-medium">
+              Are you sure? This cannot be undone.
+            </span>
+            <button
+              onClick={doReset}
+              disabled={busy}
+              className="px-4 py-2 text-sm font-medium bg-red-700 hover:bg-red-800 text-white rounded-lg transition-colors disabled:opacity-50"
+            >
+              {busy ? "Resetting..." : "Yes, Reset Everything"}
+            </button>
+            <button
+              onClick={() => setConfirming(false)}
+              disabled={busy}
+              className="px-4 py-2 text-sm font-medium bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 // Settings page
 // ============================================================
 
@@ -805,14 +940,11 @@ type TabKey =
   | "startup-script"
   | "shutdown-script"
   | "config-files"
-  | "commands"
-  | "agents"
-  | "skills"
-  | "plugins"
-  | "agents-skills"
+  | "opencode-settings"
   | "cors"
   | "recycling"
-  | "directory-mappings";
+  | "directory-mappings"
+  | "system";
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -843,14 +975,11 @@ export default function SettingsPage() {
     { key: "startup-script", label: "Startup Script" },
     { key: "shutdown-script", label: "Shutdown Script" },
     { key: "config-files", label: "Config Files" },
-    { key: "commands", label: "Commands" },
-    { key: "agents", label: "Agents" },
-    { key: "skills", label: "Skills" },
-    { key: "plugins", label: "Plugins" },
-    { key: "agents-skills", label: "Agents Skills" },
+    { key: "opencode-settings", label: "OpenCode Settings" },
     { key: "cors", label: "CORS" },
     { key: "recycling", label: "Recycling" },
     { key: "directory-mappings", label: "Dir Mappings" },
+    { key: "system", label: "System" },
   ];
 
   const tabClass = (key: TabKey) =>
@@ -975,28 +1104,9 @@ export default function SettingsPage() {
           </div>
         )}
 
-        {/* --- Dir file tabs --- */}
-        {(
-          ["commands", "agents", "skills", "plugins"] as Array<
-            "commands" | "agents" | "skills" | "plugins"
-          >
-        ).map(
-          (dir) =>
-            activeTab === dir && (
-              <DirFileManager
-                key={dir}
-                dir={dir}
-                files={settings.dirs[dir]}
-              />
-            )
-        )}
-
-        {/* --- Agents Skills --- */}
-        {activeTab === "agents-skills" && (
-          <AgentsSkillsPanel
-            skills={settings.agents_skills}
-            onChanged={loadSettings}
-          />
+        {/* --- OpenCode Settings (consolidated) --- */}
+        {activeTab === "opencode-settings" && (
+          <OpenCodeSettingsPanel settings={settings} onChanged={loadSettings} />
         )}
 
         {/* --- CORS Origins --- */}
@@ -1032,6 +1142,9 @@ export default function SettingsPage() {
             />
           </div>
         )}
+
+        {/* --- System --- */}
+        {activeTab === "system" && <SystemPanel />}
 
         {/* --- Directory Mappings --- */}
         {activeTab === "directory-mappings" && (

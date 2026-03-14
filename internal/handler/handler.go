@@ -219,6 +219,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// --- System API (protected) ---
 	mux.Handle("GET /api/system/resources", h.auth(http.HandlerFunc(h.apiSystemResources)))
+	mux.Handle("GET /api/system/setup-status", h.auth(http.HandlerFunc(h.apiSetupStatus)))
+	mux.Handle("POST /api/system/setup", h.auth(http.HandlerFunc(h.apiSetup)))
+	mux.Handle("POST /api/system/reset", h.auth(http.HandlerFunc(h.apiSystemReset)))
 
 	// --- Settings API (protected) ---
 	mux.Handle("GET /api/settings", h.auth(http.HandlerFunc(h.apiGetSettings)))
@@ -1132,6 +1135,128 @@ func (h *Handler) apiSystemResources(w http.ResponseWriter, r *http.Request) {
 		"total_memory_mb": totalMemMB,
 		"total_cpu_cores": runtime.NumCPU(),
 	})
+}
+
+func (h *Handler) apiSetupStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"setup_complete": h.config.IsSetupDone(),
+	})
+}
+
+func (h *Handler) apiSetup(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		CORSOrigins     []string                `json:"cors_origins"`
+		RecyclingPolicy *config.RecyclingPolicy `json:"recycling_policy"`
+		EnvVars         map[string]string       `json:"env_vars"`
+		AuthJSON        json.RawMessage         `json:"auth_json"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Save CORS origins
+	if len(req.CORSOrigins) > 0 {
+		if err := h.config.SetCORSOrigins(req.CORSOrigins); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to save CORS origins: "+err.Error())
+			return
+		}
+	}
+
+	// Save recycling policy
+	if req.RecyclingPolicy != nil {
+		if err := h.config.SetRecyclingPolicy(*req.RecyclingPolicy); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to save recycling policy: "+err.Error())
+			return
+		}
+	}
+
+	// Merge env vars (don't overwrite existing, just add/update)
+	if len(req.EnvVars) > 0 {
+		existing, _ := h.config.GetEnvVars()
+		if existing == nil {
+			existing = make(map[string]string)
+		}
+		for k, v := range req.EnvVars {
+			if strings.TrimSpace(v) != "" {
+				existing[k] = v
+			}
+		}
+		if err := h.config.SetEnvVars(existing); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to save env vars: "+err.Error())
+			return
+		}
+	}
+
+	// Write auth.json if provided
+	if len(req.AuthJSON) > 0 && string(req.AuthJSON) != "null" {
+		// Merge with existing auth.json content
+		existingRaw, _ := h.config.ReadFile("opencode-data/auth.json")
+		merged := make(map[string]json.RawMessage)
+		if existingRaw != "" {
+			_ = json.Unmarshal([]byte(existingRaw), &merged)
+		}
+		var incoming map[string]json.RawMessage
+		if err := json.Unmarshal(req.AuthJSON, &incoming); err == nil {
+			for k, v := range incoming {
+				merged[k] = v
+			}
+		}
+		data, err := json.MarshalIndent(merged, "", "  ")
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to marshal auth.json: "+err.Error())
+			return
+		}
+		if err := h.config.WriteFile("opencode-data/auth.json", string(data)); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to write auth.json: "+err.Error())
+			return
+		}
+	}
+
+	// Mark setup as complete
+	if err := h.config.MarkSetupDone(); err != nil {
+		log.Printf("Warning: failed to mark setup done: %v", err)
+	}
+
+	writeNoContent(w)
+}
+
+func (h *Handler) apiSystemReset(w http.ResponseWriter, r *http.Request) {
+	log.Println("System reset requested — stopping all instances...")
+
+	// 1. Stop and remove all Docker containers + volumes
+	instances, err := h.store.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list instances: "+err.Error())
+		return
+	}
+
+	if h.docker != nil {
+		for _, inst := range instances {
+			if inst.ContainerID != "" {
+				log.Printf("Removing instance %s (container %s)...", inst.ID, inst.ContainerID)
+				if err := h.docker.RemoveContainerAndVolume(r.Context(), inst.ContainerID, inst.ID); err != nil {
+					log.Printf("Warning: failed to remove container/volume for %s: %v", inst.ID, err)
+				}
+			}
+			h.proxy.Unregister(inst.ID)
+			h.config.RemoveInstanceData(inst.ID)
+		}
+	}
+
+	// 2. Delete all instances from DB
+	if err := h.store.DeleteAll(); err != nil {
+		log.Printf("Warning: failed to delete all instances from DB: %v", err)
+	}
+
+	// 3. Reset all config files
+	if err := h.config.ResetAll(); err != nil {
+		log.Printf("Warning: failed to reset config: %v", err)
+	}
+
+	log.Println("System reset complete. Setup wizard will appear on next page load.")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reset_complete"})
 }
 
 // apiDiskUsage returns a map of instanceID → disk usage bytes for all instances.

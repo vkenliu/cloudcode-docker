@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, instanceOpenUrl, Instance } from "@/lib/api";
 import AnsiLog from "@/components/AnsiLog";
@@ -220,10 +221,23 @@ function InstanceCard({
 // ---- Dashboard page --------------------------------------------------------
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [instances, setInstances] = useState<Instance[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [diskUsage, setDiskUsage] = useState<Record<string, number>>({});
+
+  // Redirect to setup wizard on first use
+  useEffect(() => {
+    api.system
+      .setupStatus()
+      .then((s) => {
+        if (!s.setup_complete) router.replace("/setup");
+      })
+      .catch(() => {
+        // Ignore — user may not be logged in yet
+      });
+  }, [router]);
 
   const loadInstances = useCallback(async () => {
     try {

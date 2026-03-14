@@ -1,7 +1,7 @@
 package store
 
 import (
-"database/sql"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -21,9 +21,9 @@ type Instance struct {
 	ErrorMsg    string            `json:"error_msg"`
 	Port        int               `json:"port"`
 	WorkDir     string            `json:"work_dir"`
-	EnvVars     map[string]string `json:"env_vars"` // API keys, GH_TOKEN, etc.
-	MemoryMB    int               `json:"memory_mb"`  // 0 = unlimited
-	CPUCores    float64           `json:"cpu_cores"` // 0 = unlimited
+	EnvVars     map[string]string `json:"env_vars"`     // API keys, GH_TOKEN, etc.
+	MemoryMB    int               `json:"memory_mb"`    // 0 = unlimited
+	CPUCores    float64           `json:"cpu_cores"`    // 0 = unlimited
 	AccessToken string            `json:"access_token"` // per-instance Basic Auth password
 	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt   time.Time         `json:"updated_at"`
@@ -44,7 +44,8 @@ func (inst *Instance) ContainerResources() container.Resources {
 
 // Store manages persistent storage of instances.
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	dbPath string
 }
 
 // New creates a new Store backed by SQLite.
@@ -64,7 +65,7 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("set WAL mode: %w", err)
 	}
 
-	s := &Store{db: db}
+	s := &Store{db: db, dbPath: dbPath}
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -179,6 +180,17 @@ func (s *Store) Update(inst *Instance) error {
 func (s *Store) Delete(id string) error {
 	_, err := s.db.Exec(`DELETE FROM instances WHERE id = ?`, id)
 	return err
+}
+
+// DeleteAll removes all instances from the database.
+func (s *Store) DeleteAll() error {
+	_, err := s.db.Exec(`DELETE FROM instances`)
+	return err
+}
+
+// DBPath returns the path to the SQLite database file.
+func (s *Store) DBPath() string {
+	return s.dbPath
 }
 
 // Close closes the database connection.
