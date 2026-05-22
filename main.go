@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,7 +22,7 @@ import (
 	"github.com/vkenliu/cloudcode-docker/internal/store"
 )
 
-//go:embed frontend/dist
+//go:embed all:frontend/dist
 var embeddedSPA embed.FS
 
 func main() {
@@ -133,12 +134,25 @@ func parseOrigins(s string) []string {
 	var out []string
 	seen := make(map[string]bool)
 	for _, o := range strings.Split(s, ",") {
-		if o = strings.TrimSpace(o); o != "" && !seen[o] {
+		if o = normalizeOrigin(o); o != "" && !seen[o] {
 			seen[o] = true
 			out = append(out, o)
 		}
 	}
 	return out
+}
+
+func normalizeOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return ""
+	}
+
+	if u, err := url.Parse(origin); err == nil && u.Scheme != "" && u.Host != "" {
+		return strings.ToLower(u.Scheme + "://" + u.Host)
+	}
+
+	return strings.ToLower(strings.TrimRight(origin, "/"))
 }
 
 // dynamicCORSMiddleware checks the request Origin against both the static CLI
@@ -148,7 +162,9 @@ func dynamicCORSMiddleware(flagOrigins []string, cfgMgr *config.Manager, next ht
 	// Pre-build a set for the static CLI origins (never changes).
 	flagSet := make(map[string]struct{}, len(flagOrigins))
 	for _, o := range flagOrigins {
-		flagSet[strings.ToLower(o)] = struct{}{}
+		if normalized := normalizeOrigin(o); normalized != "" {
+			flagSet[normalized] = struct{}{}
+		}
 	}
 
 	// Cached config origins (re-read every 30s).
@@ -179,17 +195,17 @@ func dynamicCORSMiddleware(flagOrigins []string, cfgMgr *config.Manager, next ht
 			w.Header().Add("Vary", "Origin")
 
 			allowed := false
-			lower := strings.ToLower(origin)
+			normalizedOrigin := normalizeOrigin(origin)
 
 			// Check static CLI origins first (fast path).
-			if _, ok := flagSet[lower]; ok {
+			if _, ok := flagSet[normalizedOrigin]; ok {
 				allowed = true
 			}
 
 			// Check saved config origins (cached).
 			if !allowed {
 				for _, s := range getConfigOrigins() {
-					if strings.EqualFold(s, origin) {
+					if normalizeOrigin(s) == normalizedOrigin {
 						allowed = true
 						break
 					}
@@ -199,7 +215,7 @@ func dynamicCORSMiddleware(flagOrigins []string, cfgMgr *config.Manager, next ht
 			if allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Opencode-Directory")
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 		}

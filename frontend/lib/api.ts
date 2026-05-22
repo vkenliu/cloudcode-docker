@@ -16,6 +16,7 @@ export interface Instance {
   container_id: string;
   status: InstanceStatus;
   error_msg: string;
+  host_project_path: string;
   work_dir: string;
   memory_mb: number;
   cpu_cores: number;
@@ -150,7 +151,7 @@ export async function buildWsUrl(path: string): Promise<string> {
 class ApiResponseError extends Error {
   constructor(
     public status: number,
-    public body: ApiError
+    public body: ApiError,
   ) {
     super(body.error);
   }
@@ -161,7 +162,7 @@ export { ApiResponseError };
 async function request<T>(
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
 ): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
@@ -175,9 +176,14 @@ async function request<T>(
   }
 
   // Global 401 handler: redirect to /login for browser sessions.
+  // Throw an error so callers can handle it. Only redirect if NOT already
+  // on /login to prevent infinite loops when the SPA serves the same
+  // index.html for all routes.
   if (res.status === 401 && typeof window !== "undefined") {
-    window.location.href = "/login";
-    return undefined as T;
+    if (window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+    throw new ApiResponseError(401, { error: "authentication required" });
   }
 
   const text = await res.text();
@@ -232,6 +238,7 @@ export const api = {
       name: string;
       memory_mb?: number;
       cpu_cores?: number;
+      host_project_path?: string;
       /** Per-instance env vars. Keys must match [A-Za-z_][A-Za-z0-9_]*. Override global Settings vars. */
       env_vars?: Record<string, string>;
     }): Promise<Instance> {
@@ -257,7 +264,7 @@ export const api = {
     /** Replaces per-instance env vars. Returns the updated instance (values masked). Restart required to apply. */
     updateEnvVars(
       id: string,
-      env_vars: Record<string, string>
+      env_vars: Record<string, string>,
     ): Promise<Instance> {
       return request("PATCH", `/api/instances/${id}/env-vars`, { env_vars });
     },
@@ -275,11 +282,11 @@ export const api = {
     /** Returns updated instance, null if unchanged (204), or {deleted:true} if removed */
     async pollStatus(
       id: string,
-      currentStatus: string
+      currentStatus: string,
     ): Promise<Instance | { deleted: true } | null> {
       const res = await fetch(
         `${BASE}/api/instances/${id}/status?s=${encodeURIComponent(currentStatus)}`,
-        { credentials: "include" }
+        { credentials: "include" },
       );
       if (res.status === 204) return null;
       const text = await res.text();
@@ -304,12 +311,12 @@ export const api = {
      * IDs whose status has not changed are absent from the result.
      */
     async pollAllStatus(
-      statuses: Record<string, string>
+      statuses: Record<string, string>,
     ): Promise<Record<string, Instance | null>> {
       const data = await request<{ changed: Record<string, Instance | null> }>(
         "POST",
         "/api/status/instances",
-        { ids: statuses }
+        { ids: statuses },
       );
       return data?.changed ?? {};
     },
@@ -339,7 +346,7 @@ export const api = {
     readFile(relPath: string): Promise<{ rel_path: string; content: string }> {
       return request(
         "GET",
-        `/api/settings/file?path=${encodeURIComponent(relPath)}`
+        `/api/settings/file?path=${encodeURIComponent(relPath)}`,
       );
     },
 
@@ -348,7 +355,7 @@ export const api = {
     },
 
     listDirFiles(
-      dir: "commands" | "agents" | "skills" | "plugins"
+      dir: "commands" | "agents" | "skills" | "plugins",
     ): Promise<DirFile[]> {
       return request("GET", `/api/settings/dir-files?dir=${dir}`);
     },
@@ -364,14 +371,14 @@ export const api = {
     deleteDirFile(relPath: string): Promise<void> {
       return request(
         "DELETE",
-        `/api/settings/dir-file?path=${encodeURIComponent(relPath)}`
+        `/api/settings/dir-file?path=${encodeURIComponent(relPath)}`,
       );
     },
 
     deleteAgentsSkill(name: string): Promise<void> {
       return request(
         "DELETE",
-        `/api/settings/agents-skill?name=${encodeURIComponent(name)}`
+        `/api/settings/agents-skill?name=${encodeURIComponent(name)}`,
       );
     },
 

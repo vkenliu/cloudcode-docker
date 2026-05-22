@@ -24,6 +24,9 @@ const (
 	InstTokenCookiePrefix = "_cc_inst_token_"
 	// instTokenCookieMaxAge is how long the per-instance token cookie lives.
 	instTokenCookieMaxAge = 86400 * 30 // 30 days
+	// instRouteQueryParam disambiguates same-origin OpenCode history routes
+	// from CloudCode dashboard routes on full-page reloads.
+	instRouteQueryParam = "__cc_inst"
 )
 
 // instanceEntry holds per-instance proxy state.
@@ -322,6 +325,35 @@ func injectInstanceIsolation(instanceID string) func(*http.Response) error {
       }
     };
   }
+
+  // OpenCode uses root-relative history routes like /settings and
+  // /<encoded-dir>/session/<id>, which collide with CloudCode routes on
+  // same-origin full-page reload. Tag browser history entries with the active
+  // instance so reloads can be routed back to the correct container.
+  function withInst(raw) {
+    if (raw == null || raw === "") return raw;
+    try {
+      var u = new URL(String(raw), location.href);
+      if (u.origin !== location.origin) return raw;
+      if (u.pathname === "/login" || u.pathname.indexOf("/api/") === 0 || u.pathname.indexOf("/instance/") === 0) {
+        return raw;
+      }
+      u.searchParams.set("__cc_inst", ID);
+      return u.pathname + u.search + u.hash;
+    } catch (e) {
+      return raw;
+    }
+  }
+
+  var _pushState = history.pushState;
+  history.pushState = function(state, title, url) {
+    return _pushState.call(this, state, title, withInst(url));
+  };
+
+  var _replaceState = history.replaceState;
+  history.replaceState = function(state, title, url) {
+    return _replaceState.call(this, state, title, withInst(url));
+  };
 })();
 `
 

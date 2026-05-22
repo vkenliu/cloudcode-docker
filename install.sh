@@ -10,8 +10,9 @@
 # Options:
 #   --token <TOKEN>       Platform access token (default: auto-generated)
 #   --port <PORT>         Host port for the web UI (default: 8080)
-#   --data-dir <PATH>     Data directory (default: /opt/cloudcode/data)
-#   --install-dir <PATH>  Install directory (default: /opt/cloudcode)
+#   --cors-origin <URLS>  Comma-separated allowed browser origins for CloudCode (default: https://adit-cloud.varve.ai)
+#   --data-dir <PATH>     Data directory (default: /opt/cloudcode/data; macOS Docker Desktop: ~/.cloudcode/data)
+#   --install-dir <PATH>  Install directory (default: /opt/cloudcode; macOS Docker Desktop: ~/.cloudcode)
 #   --skip-base-image     Skip building the base image (pull from GHCR instead)
 #   --china               Use Chinese mirrors for Docker, Go, Node, etc.
 #   --help                Show this help
@@ -21,8 +22,11 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/cloudcode"
 DATA_DIR=""  # set later if not overridden
+INSTALL_DIR_SET=false
+DATA_DIR_SET=false
 PORT=8080
 ACCESS_TOKEN=""
+CORS_ORIGIN="https://adit-cloud.varve.ai"
 SKIP_BASE_IMAGE=false
 CHINA_MIRROR=false
 PLATFORM_IMAGE="cloudcode:latest"
@@ -40,13 +44,101 @@ warn() { echo -e "${YELLOW}[CloudCode]${NC} $*"; }
 err()  { echo -e "${RED}[CloudCode]${NC} $*" >&2; }
 info() { echo -e "${BLUE}[CloudCode]${NC} $*"; }
 
+current_docker_context() {
+    docker context show 2>/dev/null || true
+}
+
+is_docker_desktop_context() {
+    local ctx
+    ctx="$(current_docker_context)"
+    [[ "${ctx}" == "desktop-linux" || "${ctx}" == "desktop-windows" ]]
+}
+
+detect_host_os() {
+    uname -s 2>/dev/null || echo "unknown"
+}
+
+resolve_invoking_user() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        echo "${SUDO_USER}"
+    else
+        echo "${USER:-root}"
+    fi
+}
+
+resolve_invoking_home() {
+    local user host_os home_dir
+    user="$(resolve_invoking_user)"
+    host_os="$(detect_host_os)"
+
+    if [[ "${user}" == "${USER:-}" && -n "${HOME:-}" ]]; then
+        echo "${HOME}"
+        return 0
+    fi
+
+    case "${host_os}" in
+        Darwin)
+            home_dir="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+            ;;
+        Linux)
+            if command -v getent &>/dev/null; then
+                home_dir="$(getent passwd "${user}" | cut -d: -f6)"
+            fi
+            ;;
+    esac
+
+    if [[ -z "${home_dir:-}" ]]; then
+        home_dir="$(eval echo "~${user}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${home_dir:-}" ]]; then
+        home_dir="${HOME:-/root}"
+    fi
+
+    echo "${home_dir}"
+}
+
+apply_platform_defaults() {
+    local host_os user_home
+    host_os="$(detect_host_os)"
+
+    if [[ "${host_os}" == "Darwin" && "$(current_docker_context)" == "desktop-linux" ]]; then
+        user_home="$(resolve_invoking_home)"
+        if [[ "${INSTALL_DIR_SET}" != true ]]; then
+            INSTALL_DIR="${user_home}/.cloudcode"
+        fi
+        if [[ "${DATA_DIR_SET}" != true ]]; then
+            DATA_DIR="${INSTALL_DIR}/data"
+        fi
+    fi
+}
+
+ensure_user_ownership() {
+    local user group_name host_os
+    user="$(resolve_invoking_user)"
+    host_os="$(detect_host_os)"
+
+    if [[ $EUID -ne 0 || -z "${user}" || "${user}" == "root" ]]; then
+        return 0
+    fi
+
+    case "${host_os}" in
+        Darwin) group_name="staff" ;;
+        Linux) group_name="${user}" ;;
+        *) group_name="${user}" ;;
+    esac
+
+    chown "${user}:${group_name}" "${INSTALL_DIR}" 2>/dev/null || true
+    chown "${user}:${group_name}" "${DATA_DIR}" 2>/dev/null || true
+}
+
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --token)        ACCESS_TOKEN="$2"; shift 2 ;;
         --port)         PORT="$2"; shift 2 ;;
-        --data-dir)     DATA_DIR="$2"; shift 2 ;;
-        --install-dir)  INSTALL_DIR="$2"; shift 2 ;;
+        --cors-origin)  CORS_ORIGIN="$2"; shift 2 ;;
+        --data-dir)     DATA_DIR="$2"; DATA_DIR_SET=true; shift 2 ;;
+        --install-dir)  INSTALL_DIR="$2"; INSTALL_DIR_SET=true; shift 2 ;;
         --skip-base-image) SKIP_BASE_IMAGE=true; shift ;;
         --china)        CHINA_MIRROR=true; shift ;;
         --help)
@@ -56,6 +148,8 @@ while [[ $# -gt 0 ]]; do
         *) err "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+apply_platform_defaults
 
 # Default data dir under install dir
 [[ -z "$DATA_DIR" ]] && DATA_DIR="${INSTALL_DIR}/data"
@@ -71,6 +165,7 @@ log "Starting CloudCode installation..."
 info "Install dir : ${INSTALL_DIR}"
 info "Data dir    : ${DATA_DIR}"
 info "Port        : ${PORT}"
+info "CORS origin : ${CORS_ORIGIN:-<none>}"
 info "China mirror: ${CHINA_MIRROR}"
 echo ""
 
@@ -82,14 +177,26 @@ check_root() {
 }
 
 detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_VERSION="${VERSION_ID:-unknown}"
-    else
-        OS_ID="unknown"
-        OS_VERSION="unknown"
-    fi
+    case "$(detect_host_os)" in
+        Darwin)
+            OS_ID="macos"
+            OS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo "unknown")"
+            ;;
+        Linux)
+            if [[ -f /etc/os-release ]]; then
+                . /etc/os-release
+                OS_ID="${ID:-unknown}"
+                OS_VERSION="${VERSION_ID:-unknown}"
+            else
+                OS_ID="linux"
+                OS_VERSION="unknown"
+            fi
+            ;;
+        *)
+            OS_ID="unknown"
+            OS_VERSION="unknown"
+            ;;
+    esac
     ARCH=$(uname -m)
     log "Detected OS: ${OS_ID} ${OS_VERSION} (${ARCH})"
 }
@@ -195,10 +302,43 @@ create_network() {
 }
 
 # ── Step 4: Create directories ────────────────────────────────────────────────
+validate_paths() {
+    if [[ -e "${INSTALL_DIR}" && ! -d "${INSTALL_DIR}" ]]; then
+        err "Install dir exists but is not a directory: ${INSTALL_DIR}"
+        exit 1
+    fi
+    if [[ -e "${DATA_DIR}" && ! -d "${DATA_DIR}" ]]; then
+        err "Data dir exists but is not a directory: ${DATA_DIR}"
+        exit 1
+    fi
+
+    if is_docker_desktop_context; then
+        case "${DATA_DIR}" in
+            /*)
+                case "${DATA_DIR}" in
+                    /Users/*|/Volumes/*|/private/*|/tmp/*|/var/folders/*)
+                        ;;
+                    *)
+                        err "Docker Desktop cannot bind-mount data dir from: ${DATA_DIR}"
+                        err "Use a path under /Users, /Volumes, /private, /tmp, or /var/folders."
+                        err "Example:"
+                        err "  bash install.sh --install-dir \"$(resolve_invoking_home)/.cloudcode\" --data-dir \"$(resolve_invoking_home)/.cloudcode/data\""
+                        exit 1
+                        ;;
+                esac
+                ;;
+        esac
+    fi
+}
+
 create_directories() {
     log "Creating directories..."
+    validate_paths
     mkdir -p "${INSTALL_DIR}"
     mkdir -p "${DATA_DIR}"
+    chmod 0755 "${INSTALL_DIR}" 2>/dev/null || true
+    chmod 0770 "${DATA_DIR}" 2>/dev/null || true
+    ensure_user_ownership
 }
 
 # ── Step 5: Build or pull the base image ──────────────────────────────────────
@@ -414,10 +554,12 @@ services:
     networks:
       - cloudcode-net
     restart: unless-stopped
-    command:
+    entrypoint:
       - /app/cloudcode
       - -addr
       - ":8080"
+      - -cors-origin
+      - "${CORS_ORIGIN}"
       - -data
       - /app/data
       - -access-token
@@ -467,6 +609,7 @@ print_summary() {
     echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}  Install Dir:  ${INSTALL_DIR}                                 "
     echo -e "${GREEN}║${NC}  Data Dir:     ${DATA_DIR}                                    "
+    echo -e "${GREEN}║${NC}  CORS Origin:  ${CORS_ORIGIN:-<none>}                        "
     echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}  Manage:                                                     "
     echo -e "${GREEN}║${NC}    cd ${INSTALL_DIR}                                          "

@@ -37,6 +37,12 @@ Open http://localhost:8080 in your browser and log in with the token configured 
 
 The platform uses locally built images `cloudcode:latest` and `cloudcode-base:latest`. See `install.sh` for automated setup.
 
+For a remote `adit-cloud-main` frontend hosted at `https://adit-cloud.varve.ai`, install CloudCode with an explicit browser origin:
+
+```bash
+sudo ./install.sh --cors-origin "https://adit-cloud.varve.ai"
+```
+
 ## Authentication
 
 All API, WebSocket, and proxy routes require authentication. The platform uses a single admin token set at startup.
@@ -50,7 +56,7 @@ All API, WebSocket, and proxy routes require authentication. The platform uses a
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--access-token` | *(required)* | Admin token. Server refuses to start without it. |
-| `--cors-origin` | `""` | Allowed CORS origins for the platform API (dev only). Comma-separated. |
+| `--cors-origin` | `"https://adit-cloud.varve.ai"` | Allowed browser origins for CloudCode API + proxied OpenCode requests. Comma-separated. |
 
 ### Rate limiting
 
@@ -111,6 +117,8 @@ frontend/                        Next.js 16 App Router frontend (TypeScript + Ta
 ```
 
 Each container runs `opencode web` and is accessible through the platform's reverse proxy.
+
+For browser clients, the external entry point is always the CloudCode instance route, not the internal OpenCode port. For example, if the platform is exposed at `https://submissions-skating-drew-live.trycloudflare.com` and the instance ID is `abcd1234`, the browser-facing OpenCode base URL is `https://submissions-skating-drew-live.trycloudflare.com/instance/abcd1234`.
 
 ## Configuration
 
@@ -188,6 +196,24 @@ docker build -t cloudcode-base:latest -f docker/Dockerfile docker/
 # Build platform image
 docker build -t cloudcode:latest -f Dockerfile.platform .
 ```
+
+## Remote `adit-cloud-main` Setup
+
+When `adit-cloud-main` is hosted on a different origin, CloudCode must allow that browser origin at startup. Example:
+
+```bash
+sudo ./install.sh --cors-origin "https://adit-cloud.varve.ai"
+```
+
+Then configure `adit-cloud-main` Settings with:
+
+- `CloudCode URL`: `https://submissions-skating-drew-live.trycloudflare.com`
+- `CloudCode token`: the platform `--access-token`
+
+Token usage is split by layer:
+
+- Platform `--access-token` authenticates `POST /api/auth/login` and other `/api/*` management routes.
+- Each instance response includes its own `access_token`, which authenticates browser and SDK requests to `/instance/{id}/*` such as `/session` and `/pty`.
 
 > **Important:** `go build` embeds `frontend/dist/` at compile time via `//go:embed`. Always run `bun run build` in `frontend/` before `go build` when frontend changes are made.
 

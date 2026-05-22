@@ -19,6 +19,25 @@ if [ -n "${GH_TOKEN:-}" ]; then
     echo "[*] GitHub CLI authenticated via GH_TOKEN"
 fi
 
+git_author_name="${GIT_AUTHOR_NAME:-${GIT_COMMITTER_NAME:-}}"
+git_author_email="${GIT_AUTHOR_EMAIL:-${GIT_COMMITTER_EMAIL:-}}"
+git_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+
+if [ -n "${git_author_name}" ]; then
+    git config --global user.name "${git_author_name}"
+    echo "[*] Configured git user.name from environment"
+fi
+
+if [ -n "${git_author_email}" ]; then
+    git config --global user.email "${git_author_email}"
+    echo "[*] Configured git user.email from environment"
+fi
+
+if [ -n "${git_token}" ] && command -v gh >/dev/null 2>&1; then
+    export GH_TOKEN="${git_token}"
+    gh auth setup-git >/dev/null 2>&1 || echo "Warning: gh auth setup-git failed"
+fi
+
 # Config files are bind-mounted by the management platform:
 #   /root/.config/opencode/           ← opencode.json, commands/, agents/, plugins/
 #   /root/.local/share/opencode/      ← session data (per-instance)

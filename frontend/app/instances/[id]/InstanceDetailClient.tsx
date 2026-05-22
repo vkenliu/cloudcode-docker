@@ -22,7 +22,13 @@ function Field({ label, value }: { label: string; value: string }) {
 
 // ---- Token field with copy and regenerate ------------------------------------
 
-function TokenField({ instanceId, token }: { instanceId: string; token: string }) {
+function TokenField({
+  instanceId,
+  token,
+}: {
+  instanceId: string;
+  token: string;
+}) {
   const [copied, setCopied] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [currentToken, setCurrentToken] = useState(token);
@@ -41,7 +47,7 @@ function TokenField({ instanceId, token }: { instanceId: string; token: string }
   const handleRegenerate = async () => {
     if (
       !confirm(
-        "Regenerate the access token? The current token will stop working immediately. You will need to restart the instance for the new token to take effect inside the OpenCode server."
+        "Regenerate the access token? The current token will stop working immediately. You will need to restart the instance for the new token to take effect inside the OpenCode server.",
       )
     )
       return;
@@ -84,7 +90,8 @@ function TokenField({ instanceId, token }: { instanceId: string; token: string }
       <p className="text-xs text-slate-600">
         SDK:{" "}
         <code className="text-slate-500">
-          opencode attach http://localhost:8080/instance/{instanceId}/ --password {currentToken}
+          opencode attach http://localhost:8080/instance/{instanceId}/
+          --password {currentToken}
         </code>
       </p>
     </div>
@@ -108,7 +115,7 @@ function EnvVarsEditor({
   onSaved: (updated: Instance) => void;
 }) {
   const [entries, setEntries] = useState<EnvEntry[]>(() =>
-    Object.entries(initialEnvVars).map(([k, v]) => ({ key: k, value: v }))
+    Object.entries(initialEnvVars).map(([k, v]) => ({ key: k, value: v })),
   );
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -138,7 +145,7 @@ function EnvVarsEditor({
 
   const updateRow = (i: number, field: "key" | "value", val: string) =>
     setEntries((prev) =>
-      prev.map((e, idx) => (idx === i ? { ...e, [field]: val } : e))
+      prev.map((e, idx) => (idx === i ? { ...e, [field]: val } : e)),
     );
 
   const handleSave = async () => {
@@ -147,7 +154,7 @@ function EnvVarsEditor({
       if (key === "") continue;
       if (!envKeyRe.test(key)) {
         setSaveError(
-          `Invalid key "${key}". Keys must start with a letter or underscore followed by letters, digits, or underscores.`
+          `Invalid key "${key}". Keys must start with a letter or underscore followed by letters, digits, or underscores.`,
         );
         return;
       }
@@ -168,7 +175,7 @@ function EnvVarsEditor({
       setEntries(
         Object.entries(updated.env_vars)
           .sort(([a], [b]) => a.localeCompare(b))
-          .map(([k, v]) => ({ key: k, value: v }))
+          .map(([k, v]) => ({ key: k, value: v })),
       );
       setSaveOk(true);
       setTimeout(() => setSaveOk(false), 3000);
@@ -265,10 +272,7 @@ function EnvVarsEditor({
 
 function LogPanel({ instanceId }: { instanceId: string }) {
   return (
-    <AnsiLog
-      wsUrl={`/instances/${instanceId}/logs/ws`}
-      className="h-64"
-    />
+    <AnsiLog wsUrl={`/instances/${instanceId}/logs/ws`} className="h-64" />
   );
 }
 
@@ -306,7 +310,10 @@ export default function InstanceDetailPage() {
     const poll = async () => {
       if (cancelledRef.current) return;
       try {
-        const result = await api.instances.pollStatus(id, currentStatusRef.current);
+        const result = await api.instances.pollStatus(
+          id,
+          currentStatusRef.current,
+        );
         if (cancelledRef.current) return;
         if (result === null) {
           // unchanged
@@ -481,14 +488,20 @@ export default function InstanceDetailPage() {
           label="Container ID"
           value={instance.container_id?.slice(0, 16) ?? ""}
         />
+        {instance.host_project_path && (
+          <div className="col-span-2">
+            <Field
+              label="Host Project Path"
+              value={instance.host_project_path}
+            />
+          </div>
+        )}
         <Field label="Work Dir" value={instance.work_dir} />
         <Field label="Status" value={instance.status} />
         <Field
           label="Memory"
           value={
-            instance.memory_mb === 0
-              ? "unlimited"
-              : `${instance.memory_mb} MB`
+            instance.memory_mb === 0 ? "unlimited" : `${instance.memory_mb} MB`
           }
         />
         <Field

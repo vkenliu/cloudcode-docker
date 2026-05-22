@@ -10,10 +10,39 @@ interface EnvEntry {
   value: string;
 }
 
+type SourceMode = "empty" | "local";
+
+const RECENT_PROJECT_PATHS_KEY = "cloudcode.recentProjectPaths";
+
+function loadRecentProjectPaths(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(RECENT_PROJECT_PATHS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentProjectPaths(paths: string[]): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(
+    RECENT_PROJECT_PATHS_KEY,
+    JSON.stringify(paths.slice(0, 5)),
+  );
+}
+
 export default function NewInstancePage() {
   const router = useRouter();
   const [resources, setResources] = useState<SystemResources | null>(null);
   const [name, setName] = useState("");
+  const [sourceMode, setSourceMode] = useState<SourceMode>("empty");
+  const [hostProjectPath, setHostProjectPath] = useState("");
+  const [recentProjectPaths, setRecentProjectPaths] = useState<string[]>([]);
   const [memoryMb, setMemoryMb] = useState(2048);
   const [cpuCores, setCpuCores] = useState(2);
   const [envEntries, setEnvEntries] = useState<EnvEntry[]>([]);
@@ -23,7 +52,11 @@ export default function NewInstancePage() {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    api.system.resources().then(setResources).catch(() => null);
+    api.system
+      .resources()
+      .then(setResources)
+      .catch(() => null);
+    setRecentProjectPaths(loadRecentProjectPaths());
   }, []);
 
   // Env var editor helpers
@@ -35,7 +68,9 @@ export default function NewInstancePage() {
 
   const updateEnvRow = (i: number, field: "key" | "value", val: string) =>
     setEnvEntries((prev) =>
-      prev.map((entry, idx) => (idx === i ? { ...entry, [field]: val } : entry))
+      prev.map((entry, idx) =>
+        idx === i ? { ...entry, [field]: val } : entry,
+      ),
     );
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -52,6 +87,16 @@ export default function NewInstancePage() {
       setError("CPU cores must be a non-negative number (0 = unlimited)");
       return;
     }
+    if (sourceMode === "local") {
+      if (!hostProjectPath.trim()) {
+        setError("Host project path is required");
+        return;
+      }
+      if (!hostProjectPath.trim().startsWith("/")) {
+        setError("Host project path must be an absolute path");
+        return;
+      }
+    }
 
     // Validate env var keys before sending
     const envKeyRe = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -59,7 +104,7 @@ export default function NewInstancePage() {
       if (key === "") continue; // skip blank rows
       if (!envKeyRe.test(key)) {
         setError(
-          `Invalid env var key "${key}". Keys must start with a letter or underscore, followed by letters, digits, or underscores.`
+          `Invalid env var key "${key}". Keys must start with a letter or underscore, followed by letters, digits, or underscores.`,
         );
         return;
       }
@@ -78,8 +123,20 @@ export default function NewInstancePage() {
         name: name.trim(),
         memory_mb: memoryMb,
         cpu_cores: cpuCores,
+        host_project_path:
+          sourceMode === "local" ? hostProjectPath.trim() : undefined,
         env_vars,
       });
+      if (sourceMode === "local") {
+        const nextRecentPaths = [
+          hostProjectPath.trim(),
+          ...recentProjectPaths.filter(
+            (value) => value !== hostProjectPath.trim(),
+          ),
+        ].slice(0, 5);
+        setRecentProjectPaths(nextRecentPaths);
+        saveRecentProjectPaths(nextRecentPaths);
+      }
       setCreated(inst);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -99,9 +156,7 @@ export default function NewInstancePage() {
   if (created) {
     return (
       <div className="max-w-lg mx-auto">
-        <h1 className="text-2xl font-bold text-white mb-2">
-          Instance Created
-        </h1>
+        <h1 className="text-2xl font-bold text-white mb-2">Instance Created</h1>
         <p className="text-slate-400 text-sm mb-6">
           Save the access token below. It is shown once and can be retrieved
           later from the instance detail page (requires platform login).
@@ -129,6 +184,18 @@ export default function NewInstancePage() {
             opencode attach {instanceOpenUrl(created.id, created.access_token)}{" "}
             --password {created.access_token}
           </code>
+          {created.host_project_path && (
+            <div className="mt-4 space-y-2 text-xs">
+              <p className="text-slate-500">Host project path</p>
+              <code className="block text-slate-300 break-all">
+                {created.host_project_path}
+              </code>
+              <p className="text-slate-500">Container work dir</p>
+              <code className="block text-slate-300 break-all">
+                {created.work_dir}
+              </code>
+            </div>
+          )}
         </div>
 
         <div className="flex gap-3">
@@ -167,6 +234,91 @@ export default function NewInstancePage() {
         onSubmit={handleSubmit}
         className="bg-slate-800 border border-slate-700 rounded-xl p-6 flex flex-col gap-5"
       >
+        <div>
+          <label className="block text-sm font-medium text-slate-300 mb-2">
+            Project Source
+          </label>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setSourceMode("empty")}
+              className={`rounded-lg border px-4 py-3 text-left transition-colors ${
+                sourceMode === "empty"
+                  ? "border-blue-500 bg-blue-500/10"
+                  : "border-slate-600 bg-slate-900 hover:border-slate-500"
+              }`}
+            >
+              <div className="text-sm font-medium text-white">
+                Empty Workspace
+              </div>
+              <div className="mt-1 text-xs text-slate-400">
+                Start in the default container workspace and clone or create
+                files later.
+              </div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSourceMode("local")}
+              className={`rounded-lg border px-4 py-3 text-left transition-colors ${
+                sourceMode === "local"
+                  ? "border-blue-500 bg-blue-500/10"
+                  : "border-slate-600 bg-slate-900 hover:border-slate-500"
+              }`}
+            >
+              <div className="text-sm font-medium text-white">
+                Mount Local Project
+              </div>
+              <div className="mt-1 text-xs text-slate-400">
+                Bind a host directory into the container and open OpenCode in
+                that project.
+              </div>
+            </button>
+          </div>
+        </div>
+
+        {sourceMode === "local" && (
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-1.5">
+              Host Project Path
+            </label>
+            <input
+              type="text"
+              value={hostProjectPath}
+              onChange={(e) => setHostProjectPath(e.target.value)}
+              placeholder="/Users/edy/develop/coding/adit"
+              required
+              className="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+            />
+            <p className="text-xs text-slate-500 mt-1">
+              Use an absolute host path. The project will be mounted under
+              <code className="ml-1 text-slate-400">
+                /workspace/&lt;project-name&gt;
+              </code>
+              .
+            </p>
+            {recentProjectPaths.length > 0 && (
+              <div className="mt-3">
+                <p className="text-xs text-slate-500 mb-2">Recent projects</p>
+                <div className="flex flex-wrap gap-2">
+                  {recentProjectPaths.map((path) => (
+                    <button
+                      key={path}
+                      type="button"
+                      onClick={() => setHostProjectPath(path)}
+                      className="rounded-md border border-slate-600 bg-slate-900 px-2.5 py-1 text-xs text-slate-300 hover:border-slate-500"
+                    >
+                      {path}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Name */}
         <div>
           <label className="block text-sm font-medium text-slate-300 mb-1.5">
